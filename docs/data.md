@@ -1,13 +1,12 @@
-# Data
+# 数据
 
-The only source dataset contract supported by OMG is the official
+OMG 唯一支持的源数据集约定是官方
 [THU-MARS/OMG-Data](https://huggingface.co/datasets/THU-MARS/OMG-Data)
-LeRobotDataset v3 release. Training, statistics, generation sample selection,
-and benchmarks all resolve samples from this contract.
+LeRobotDataset v3 发布版本。训练、统计量计算、生成样本选择和基准测试都从该约定解析样本。
 
-## Canonical release
+## 规范发布版本
 
-Place the dataset at `data/OMG-Data`, or set:
+请将数据集放在 `data/OMG-Data`，或设置：
 
 ```bash
 export OMG_DATA_ROOT=/path/to/OMG-Data
@@ -24,7 +23,7 @@ hf cache verify THU-MARS/OMG-Data \
   --fail-on-missing-files
 ```
 
-The expected layout is:
+预期目录结构如下：
 
 ```text
 OMG-Data/
@@ -35,39 +34,34 @@ OMG-Data/
   meta/episodes/chunk-*/file-*.parquet
 ```
 
-`observation.state` stores G1 `qpos_36`; text is represented by the standard
-LeRobot task table. The aligned optional modalities are
-`omg.audio.feature` and `omg.humanref.motion`, with explicit per-frame masks.
-Episode metadata also carries the immutable source identity fields used by the
-benchmark manifests.
+`observation.state` 存储 G1 `qpos_36`；文本由标准 LeRobot 任务表表示。
+对齐的可选模态为 `omg.audio.feature` 和 `omg.humanref.motion`，
+并带有显式的逐帧掩码。片段元数据还包含基准测试清单所使用的不可变源身份字段。
 
-Both public configs pin the same dataset revision:
+两个公开配置都固定到相同的数据集版本：
 
 ```text
 configs/generation/data/omg_data_lerobot.yaml
 configs/generation/data/omg_data_lerobot_omnimodal.yaml
 ```
 
-The first enables text only. The second enables text, audio, and human
-reference conditioning. The loader verifies both the full 40-character Hub
-revision and the SHA-256 of `meta/omg_manifest.json`; pointing
-`OMG_DATA_ROOT` at an older or different local snapshot fails before any
-training or benchmark samples are read.
+第一个配置只启用文本。第二个配置启用文本、音频和人体参考条件。
+加载器会同时验证完整的 40 字符 Hub 版本和 `meta/omg_manifest.json` 的 SHA-256；
+如果 `OMG_DATA_ROOT` 指向更旧或不同的本地快照，则会在读取任何训练或基准测试样本前报错。
 
-## G1 representation
+## G1 表示
 
-The source state has 36 values:
+源状态包含 36 个值：
 
-- root position: 3;
-- root quaternion in `wxyz`: 4;
-- G1 joint positions: 29.
+- 根节点位置：3；
+- `wxyz` 格式的根节点四元数：4；
+- G1 关节位置：29。
 
-The default model representation is defined by
-`configs/generation/representation/125d.yaml`. It converts LeRobot windows to
-the 125D model features and uses `assets/stats/g1_125d_stats.json` for
-normalization.
+默认模型表示由 `configs/generation/representation/125d.yaml` 定义。
+它将 LeRobot 窗口转换为 125 维模型特征，并使用
+`assets/stats/g1_125d_stats.json` 进行归一化。
 
-Compute statistics directly from the canonical dataset with:
+使用以下命令直接从规范数据集计算统计量：
 
 ```bash
 PYTHONPATH=src python -m omg.cli.generation.compute_stats \
@@ -77,15 +71,13 @@ PYTHONPATH=src python -m omg.cli.generation.compute_stats \
   --output assets/stats/g1_125d_stats.json
 ```
 
-Recompute statistics whenever the pinned dataset revision, representation,
-window length, or preprocessing changes.
+只要固定的数据集版本、表示、窗口长度或预处理发生变化，就应重新计算统计量。
 
-## Optional episode cache
+## 可选片段缓存
 
-For large training runs, OMG can derive a frame-level episode cache from the
-pinned LeRobot source. The cache is an optimization layer, not another source
-dataset format: its manifest records the LeRobot identity and it must pass the
-strict validator before use.
+对于大规模训练，OMG 可以从固定版本的 LeRobot 源派生帧级片段缓存。
+该缓存是优化层，而不是另一种源数据集格式：其清单会记录 LeRobot 身份，
+并且在使用前必须通过严格验证器。
 
 ```bash
 export OMG_MATERIALIZED_ROOT=/path/to/OMG-Data/materialized
@@ -94,28 +86,25 @@ PYTHONPATH=src python -m omg.cli.data.validate_episode_cache \
   "$OMG_MATERIALIZED_ROOT/omg_episode_cache_v2_rot6d_seq60_hist10_k1"
 ```
 
-`omg_data_materialized` and `omg_data_materialized_omnimodal` read only this
-derived cache. Deleting the cache never removes canonical data; it can be
-recreated from the pinned LeRobot release.
-Legacy v1 caches have no verifiable source revision and are intentionally not
-accepted; rebuild them into the v2 path.
+`omg_data_materialized` 和 `omg_data_materialized_omnimodal` 只读取此派生缓存。
+删除缓存不会移除规范数据；可从固定版本的 LeRobot 发布资源重新创建。
+旧版 v1 缓存没有可验证的源版本，因此不会被接受；请将其重建到 v2 路径。
 
-## Benchmark sample identity
+## 基准测试样本身份
 
-Benchmark manifests use `omg.benchmark.sample.v2`. Every row pins:
+基准测试清单使用 `omg.benchmark.sample.v2`。每一行都会固定：
 
-- `repo_id`, `revision`, and `split`;
-- `episode_index`, `window_start`, and `num_frames`;
-- source dataset, source id, segment index, and source frame interval.
+- `repo_id`、`revision` 和 `split`；
+- `episode_index`、`window_start` 和 `num_frames`；
+- 源数据集、源 ID、分段索引和源帧区间。
 
-The runner resolves that complete identity against LeRobot metadata and fails
-if any field disagrees. Local list indices, private filesystem paths, and the
-removed `.npz + labels + info.yaml` layout are not valid benchmark identities.
-The validated release set lives at
-`assets/benchmarks/mixed_modalities_all_v2`; its summary records the data
-revision, manifest hashes, cohort counts, and frame-level validation outcome.
+运行器会根据 LeRobot 元数据解析完整身份，只要任一字段不一致就会报错。
+本地列表索引、私有文件系统路径以及已移除的 `.npz + labels + info.yaml` 布局
+都不是有效的基准测试身份。已验证的发布集合位于
+`assets/benchmarks/mixed_modalities_all_v2`；其摘要记录数据版本、清单哈希、
+群组数量和帧级验证结果。
 
-Prepare all three benchmark cohorts with:
+使用以下命令准备全部三类基准测试群组：
 
 ```bash
 PYTHONPATH=src python -m omg.cli.evaluation.prepare_samples \
@@ -123,20 +112,16 @@ PYTHONPATH=src python -m omg.cli.evaluation.prepare_samples \
   --output_dir outputs/benchmark_samples/mixed_modalities_all_v2
 ```
 
-Condition eligibility follows the release protocol: text needs a non-empty
-task and uses the motion-valid mask for short clips, while every requested
-audio or human-reference frame must have its corresponding condition mask set.
-Sampling remains balanced over the original release benchmark
-cohorts; the four language-specific BEAT2 source groups form one human-reference
-cohort so the protocol remains comparable to `mixed_modalities_all_v1`.
+条件资格遵循发布协议：文本需要非空任务，短片段使用动作有效掩码；
+每个请求的音频帧或人体参考帧都必须设置相应的条件掩码。
+采样在原始发布基准群组间保持均衡；四个特定语言的 BEAT2 源组共同构成一个人体参考群组，
+从而使协议仍可与 `mixed_modalities_all_v1` 比较。
 
-## External inference conditions
+## 外部推理条件
 
-Standalone generation may accept explicit motion, audio, or human-reference
-artifacts. These are inference inputs and outputs, not training datasets. OMG
-does not infer sibling files from filenames or silently repair missing
-conditions; callers must pass each artifact explicitly.
+独立生成可以接收显式的动作、音频或人体参考制品。它们是推理输入和输出，
+而不是训练数据集。OMG 不会根据文件名推断同级文件，也不会静默修复缺失条件；
+调用方必须显式传入每个制品。
 
-For new training data, publish it as a LeRobotDataset v3 revision containing
-the same required state, task, modality, mask, split, and immutable identity
-fields. Do not add another repository-specific source loader.
+对于新的训练数据，请将其发布为 LeRobotDataset v3 版本，并包含相同的必需状态、
+任务、模态、掩码、数据划分和不可变身份字段。不要添加其他仓库专用的源加载器。

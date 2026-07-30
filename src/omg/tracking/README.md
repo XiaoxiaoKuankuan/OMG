@@ -1,10 +1,9 @@
-# Tracking
+# 跟踪
 
-This package contains motion tracking integrations. HoloMotion is the supported
-downstream tracker for Unitree G1 reference motion.
+此包包含动作跟踪集成。HoloMotion 是受支持的下游跟踪器，
+用于跟踪 Unitree G1 参考动作。
 
-The integration boundary is `qpos_36` reference motion plus metadata. Tracking
-code should depend on shared motion and robot modules, not on generation
-internals.
+集成边界由 `qpos_36` 参考动作及元数据构成。跟踪代码应依赖共享的动作和机器人模块，
+而不应依赖生成模块的内部实现。
 
-See `docs/tracking.md` for the release workflow.
+发布工作流请参阅 `docs/tracking.md`。

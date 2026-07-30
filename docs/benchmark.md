@@ -1,58 +1,55 @@
-# Benchmark
+# 基准测试
 
-Benchmarks evaluate generated reference motion and tracker-executed motion.
+基准测试评估生成的参考动作以及跟踪器执行后的动作。
 
-## Main Entry
+## 主入口
 
 ```bash
 PYTHONPATH=src python -m omg.cli.generation.benchmark --help
 ```
 
-The benchmark runners live under:
+基准测试运行器位于：
 
 ```text
 src/omg/benchmarks/
 ```
 
-They support text, audio, human-reference, artifact-based, and tracker-executed
-evaluation paths.
+它们支持文本、音频、人体参考、基于制品以及跟踪器执行后的评估路径。
 
-## Evaluator Checkpoint
+## 评估器检查点
 
-Evaluator-based distribution and retrieval metrics require the released OMG
-evaluator checkpoint:
+基于评估器的分布和检索指标需要已发布的 OMG 评估器检查点：
 
 ```text
 https://huggingface.co/THU-MARS/OMG/blob/main/evaluator/step_004000.pt
 ```
 
-Recommended local path:
+推荐的本地路径：
 
 ```text
 models/evaluator/pretrained.ckpt
 ```
 
-Text retrieval metrics also use a [T5-3B text encoder](https://huggingface.co/google-t5/t5-3b). By default, the benchmark
-loads `t5-3b`, or a local path from `OMG_T5_3B_MODEL`.
+文本检索指标还会使用 [T5-3B 文本编码器](https://huggingface.co/google-t5/t5-3b)。
+默认情况下，基准测试加载 `t5-3b`，也可以从 `OMG_T5_3B_MODEL` 读取本地路径。
 
-For offline runs:
+离线运行时：
 
 ```bash
 hf download google-t5/t5-3b --local-dir models/t5-3b-local
 export OMG_T5_3B_MODEL=models/t5-3b-local
 ```
 
-## Sample Preparation
+## 样本准备
 
-The validated release manifests are committed at:
+已验证的发布清单提交在：
 
 ```text
 assets/benchmarks/mixed_modalities_all_v2/
 ```
 
-Use these files for paper/release comparisons. To intentionally define a new
-benchmark release, regenerate candidates from the pinned public LeRobotDataset
-v3 source:
+论文/发布版本对比请使用这些文件。如果确实要定义新的基准测试版本，
+请从固定版本的公开 LeRobotDataset v3 源重新生成候选样本：
 
 ```bash
 PYTHONPATH=src python -m omg.cli.evaluation.prepare_samples \
@@ -60,70 +57,62 @@ PYTHONPATH=src python -m omg.cli.evaluation.prepare_samples \
   --output_dir outputs/benchmark_samples/mixed_modalities_all_v2
 ```
 
-The generated `omg.benchmark.sample.v2` rows contain the repository revision,
-split, episode, exact window, and source identity. Runners resolve every field
-against LeRobot metadata and reject stale or mismatched manifests. The same
-fixed rows can therefore be shared by checkpoint and artifact evaluations
-without relying on machine-local indices or private source paths.
+生成的 `omg.benchmark.sample.v2` 行包含仓库版本、数据划分、片段、精确窗口和源身份。
+运行器会根据 LeRobot 元数据解析每个字段，并拒绝过期或不匹配的清单。因此，
+检查点评估和制品评估可以共享相同的固定行，而无需依赖计算机本地索引或私有源路径。
 
-The preparation command preserves the release cohort protocol (12 text
-cohorts, 5 audio cohorts, and 11 human-reference cohorts) while resolving each
-selected row to its canonical LeRobot source dataset.
+准备命令会保留发布群组协议（12 个文本群组、5 个音频群组和 11 个人体参考群组），
+同时将每个选中行解析到其规范的 LeRobot 源数据集。
 
-Use the committed manifest as input to benchmark runners, for example with
-`--samples_path assets/benchmarks/mixed_modalities_all_v2/text_test_1024.jsonl`.
-Dataset names passed through
-`--datasets` are exact values from the `omg/dataset` episode column.
-External baseline reproduction scripts live on the `repro/baselines` branch;
-`main` keeps the benchmark artifact interface only.
+请将已提交的清单用作基准测试运行器的输入，例如使用
+`--samples_path assets/benchmarks/mixed_modalities_all_v2/text_test_1024.jsonl`。
+通过 `--datasets` 传入的数据集名称必须是 `omg/dataset` 片段列中的精确值。
+外部基线复现脚本位于 `repro/baselines` 分支；`main` 仅保留基准测试制品接口。
 
-## Physical Metrics
+## 物理指标
 
-Run physical metrics on a motion artifact:
+对动作制品运行物理指标：
 
 ```bash
 PYTHONPATH=src python -m omg.cli.generation.physical_benchmark \
   --motion outputs_pipeline/run/reference_motion.npz
 ```
 
-The representative physical metrics are:
+代表性的物理指标包括：
 
-- `contact_sliding_speed`: average horizontal foot speed while a foot is in contact.
-- `body_jerk_mean`: mean third finite difference magnitude of body positions.
-- `foot_ground_error`: mean absolute signed distance from the lowest sole proxy
-  point to the ground plane.
+- `contact_sliding_speed`：脚部接触地面时的平均水平速度。
+- `body_jerk_mean`：身体位置三阶有限差分幅值的平均值。
+- `foot_ground_error`：最低鞋底代理点到地平面的有符号距离绝对值的平均值。
 
-The default stats path is:
+默认统计量路径为：
 
 ```text
 assets/stats/g1_125d_stats.json
 ```
 
-Generate this file with `omg.cli.generation.compute_stats` before running
-benchmarks that load the motion representation.
+运行需要加载动作表示的基准测试前，请使用 `omg.cli.generation.compute_stats`
+生成此文件。
 
-## Tracker-Executed Evaluation
+## 跟踪器执行评估
 
-Tracker-executed metrics answer whether a generated reference can be followed by
-the downstream tracker. Enable tracker execution in benchmark runners with the
-tracker arguments exposed by each runner:
+跟踪器执行指标用于判断下游跟踪器能否跟随生成的参考动作。使用各运行器提供的
+跟踪器参数，在基准测试运行器中启用跟踪器执行：
 
 ```text
 --tracker_executed
 --tracker_holomotion_onnx ...
 ```
 
-The runner writes tracker-executed artifacts and metrics next to the benchmark
-outputs.
+运行器会将跟踪器执行后的制品和指标写入基准测试输出旁。
 
-## Output Files
+## 输出文件
 
-Common benchmark outputs:
+常见的基准测试输出：
 
 - `benchmark.json`
 - `metrics.json`
-- per-metric JSON files such as `physical_metrics.json`
-- tracker-executed rollout artifacts when enabled
+- 各指标的 JSON 文件，例如 `physical_metrics.json`
+- 启用时的跟踪器执行过程制品
 
-Use JSON outputs as the canonical source for tables. Markdown summaries should
-be regenerated from JSON rather than edited by hand.
+请将 JSON 输出作为表格的规范来源。Markdown 摘要应从 JSON 重新生成，
+而不是手动编辑。

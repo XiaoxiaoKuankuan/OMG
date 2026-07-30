@@ -1,49 +1,45 @@
-# Realtime G1 Deployment
+# G1 实时部署
 
-Realtime deployment uses three processes:
+实时部署使用三个进程：
 
-1. HoloMotion deployment on the G1 Orin.
-2. OMG realtime planner server on a GPU workstation.
-3. OMG real bridge on the G1 Orin.
+1. G1 Orin 上的 HoloMotion 部署进程。
+2. GPU 工作站上的 OMG 实时规划器服务器。
+3. G1 Orin 上的 OMG 实机桥接器。
 
-The planner server owns diffusion inference. The real bridge reads robot
-lowstate, builds history, sends condition-sequence requests, receives planned
-future motion, and publishes HoloMotion `obs65` reference packets.
+规划器服务器负责扩散推理。实机桥接器读取机器人 lowstate、构建历史、发送条件序列请求、
+接收规划的未来动作，并发布 HoloMotion `obs65` 参考数据包。
 
-## Runtime Environment
+## 运行环境
 
-Realtime deployment uses two machines:
+实时部署使用两台计算机：
 
-- GPU workstation: runs `omg.cli.realtime.planner_server`.
-- G1 Orin: runs HoloMotion deployment and `omg.cli.realtime.holomotion_real_bridge`.
+- GPU 工作站：运行 `omg.cli.realtime.planner_server`。
+- G1 Orin：运行 HoloMotion 部署进程和 `omg.cli.realtime.holomotion_real_bridge`。
 
-The G1 Orin environment must provide Unitree ROS messages, including
-`unitree_hg.msg.LowState`. Run the real bridge inside the HoloMotion deployment
-environment or container where those ROS packages are sourced.
+G1 Orin 环境必须提供 Unitree ROS 消息，包括 `unitree_hg.msg.LowState`。
+请在已加载这些 ROS 包的 HoloMotion 部署环境或容器中运行实机桥接器。
 
-## Network
+## 网络
 
-The G1 Orin must reach the workstation planner bind address. Use wired Ethernet
-when available. Wi-Fi can work, but planner latency and jitter should be checked
-before live tests.
+G1 Orin 必须能够访问工作站规划器的绑定地址。条件允许时请使用有线以太网。
+也可以使用 Wi-Fi，但实机测试前应检查规划器延迟和抖动。
 
-Example workstation planner address:
+工作站规划器地址示例：
 
 ```text
 tcp://10.0.20.14:5571
 ```
 
-## Terminal 1: HoloMotion on G1
+## 终端 1：G1 上的 HoloMotion
 
-Run inside the G1 HoloMotion deployment directory:
+在 G1 HoloMotion 部署目录中运行：
 
 ```bash
 cd /home/unitree/holomotion/deployment/unitree_g1_ros2_29dof
 ./launch_holomotion_29dof_docker.sh
 ```
 
-The active launch profile must configure HoloMotion to subscribe to OMG
-latest-obs ZMQ:
+活动的启动配置必须将 HoloMotion 配置为订阅 OMG latest-obs ZMQ：
 
 ```yaml
 latest_obs_zmq_uri: tcp://127.0.0.1:6001
@@ -52,10 +48,9 @@ latest_obs_zmq_mode: connect
 enable_teleop_reference: true
 ```
 
-Keep runtime and deployment fields in the launch profile, not in the robot
-config YAML.
+请将运行时和部署字段保留在启动配置中，而不要放入机器人配置 YAML。
 
-## Terminal 2: Planner Server on Workstation
+## 终端 2：工作站上的规划器服务器
 
 ```bash
 cd /path/to/OMG
@@ -70,13 +65,12 @@ PYTHONPATH=src CUDA_VISIBLE_DEVICES=0 python -m omg.cli.realtime.planner_server 
   --log-jsonl outputs_realtime/planner.jsonl
 ```
 
-The planner server does not own the prompt. Conditions come from bridge request
-metadata. This keeps runtime condition changes on the robot-side bridge command.
+规划器服务器不负责提示词。条件来自桥接器请求的元数据，
+因此运行时条件变更保留在机器人侧的桥接器命令中。
 
-## Terminal 3: Real Bridge on G1
+## 终端 3：G1 上的实机桥接器
 
-Run inside the HoloMotion deployment environment or container where Unitree ROS
-messages are available:
+请在能够使用 Unitree ROS 消息的 HoloMotion 部署环境或容器中运行：
 
 ```bash
 cd /home/unitree/OMG
@@ -98,13 +92,12 @@ PYTHONPATH=src:$PYTHONPATH /root/miniconda3/envs/holomotion_deploy/bin/python \
   --output /home/unitree/OMG/outputs_realtime/real_demo/bridge.npz
 ```
 
-With `--activation-mode remote-b`, the bridge waits for the Unitree remote B
-button before it starts sending active replans. The first active replan uses
-live lowstate history.
+使用 `--activation-mode remote-b` 时，桥接器会等待按下 Unitree 遥控器的 B 键，
+随后才开始发送主动重新规划请求。第一次主动重新规划使用实时 lowstate 历史。
 
-## Dry Run
+## 空运行
 
-Before live tests, run a dry bridge against the planner:
+实机测试前，请针对规划器运行桥接器空运行：
 
 ```bash
 PYTHONPATH=src python -m omg.cli.realtime.holomotion_dry_run \
@@ -121,32 +114,31 @@ PYTHONPATH=src python -m omg.cli.realtime.holomotion_dry_run \
   --output outputs_realtime/dry_run/bridge.npz
 ```
 
-Add `--sim-stream-bind 127.0.0.1:7870` to view a local MuJoCo stream at
-`http://127.0.0.1:7870/video.mjpg`.
+添加 `--sim-stream-bind 127.0.0.1:7870` 后，可在
+`http://127.0.0.1:7870/video.mjpg` 查看本地 MuJoCo 视频流。
 
-## Logs
+## 日志
 
-Planner log lines include:
+规划器日志行包括：
 
 ```text
 [replan 0001] request=... frame=... buffer=... prompt='walk forward' latency=...
 ```
 
-Bridge log lines include:
+桥接器日志行包括：
 
 ```text
 [real-bridge replan 0001] request=... append=... history=lowstate ...
 ```
 
-Check:
+请检查：
 
-- `history=lowstate` after activation.
-- lowstate age stays small.
-- bridge latency is close to server latency plus network/request overhead.
-- reference buffer does not drain to zero.
+- 激活后出现 `history=lowstate`。
+- lowstate 数据的时间戳延迟始终较小。
+- 桥接器延迟接近服务器延迟与网络/请求开销之和。
+- 参考缓冲区不会耗尽至零。
 
-## Safety
+## 安全
 
-Test HoloMotion standalone before realtime diffusion. Keep the Unitree remote
-available and verify emergency stop behavior before pressing B for active
-realtime rollout.
+进行实时扩散前，请先单独测试 HoloMotion。确保 Unitree 遥控器随时可用，
+并在按下 B 键开始主动实时执行前验证紧急停止功能。

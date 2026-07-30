@@ -1,31 +1,30 @@
-# Development
+# 开发
 
-## Package Layout
+## 包结构
 
 ```text
 src/omg/
-  benchmarks/    Benchmark metrics, runners, reports, and evaluator inference.
-  callbacks/      Lightning callbacks.
-  cli/            User-facing command-line entry points.
-  core/           Small shared logging/path/tensor utilities.
-  data/           Canonical LeRobotDataset v3 reader and derived episode cache.
-  generation/     Training data, denoisers, diffusion, losses, export.
-  motion/         G1 motion representation utilities.
-  pipeline/       Offline diffusion and tracker orchestration.
-  realtime/       ZMQ protocol, planner service, realtime buffers.
-  render/         MuJoCo rendering.
-  robots/         G1 kinematics and constants.
-  runtime/        Runtime helpers such as ONNX provider setup.
-  tracking/       HoloMotion tracker integration.
+  benchmarks/    基准指标、运行器、报告和评估器推理。
+  callbacks/      Lightning 回调。
+  cli/            面向用户的命令行入口。
+  core/           小型共享日志、路径和张量工具。
+  data/           规范的 LeRobotDataset v3 读取器及派生片段缓存。
+  generation/     训练数据、去噪器、扩散、损失和导出。
+  motion/         G1 动作表示工具。
+  pipeline/       离线扩散和跟踪器编排。
+  realtime/       ZMQ 协议、规划器服务和实时缓冲区。
+  render/         MuJoCo 渲染。
+  robots/         G1 运动学和常量。
+  runtime/        ONNX 提供程序设置等运行时辅助工具。
+  tracking/       HoloMotion 跟踪器集成。
 ```
 
-External baseline reproduction code is kept on the `repro/baselines` branch.
-The release `main` branch keeps only the artifact benchmark interface needed to
-evaluate generated `qpos_36` outputs.
+外部基线复现代码保存在 `repro/baselines` 分支。
+发布用的 `main` 分支仅保留评估生成的 `qpos_36` 输出所需的制品基准接口。
 
-## CLI Entry Points
+## CLI 入口
 
-Generation:
+生成：
 
 ```text
 omg.cli.generation.train
@@ -35,20 +34,20 @@ omg.cli.generation.benchmark
 omg.cli.generation.physical_benchmark
 ```
 
-Pipeline:
+流水线：
 
 ```text
 omg.cli.pipeline.main
 ```
 
-Tracking:
+跟踪：
 
 ```text
 omg.cli.tracking.holomotion
 omg.cli.tracking.export_holomotion_clip
 ```
 
-Realtime:
+实时：
 
 ```text
 omg.cli.realtime.planner_server
@@ -57,21 +56,21 @@ omg.cli.realtime.holomotion_dry_run
 omg.cli.realtime.policy_node_smoke_driver
 ```
 
-## Tests
+## 测试
 
-Run the test suite with:
+使用以下命令运行测试套件：
 
 ```bash
 PYTHONPATH=src pytest
 ```
 
-Lightweight syntax check:
+轻量级语法检查：
 
 ```bash
 python3 -m compileall -q src/omg tests
 ```
 
-Before committing:
+提交前：
 
 ```bash
 git diff --check

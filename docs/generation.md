@@ -1,24 +1,22 @@
-# Generation
+# 生成
 
-The main offline pipeline entry point is:
+主要的离线流水线入口为：
 
 ```bash
 PYTHONPATH=src python -m omg.cli.pipeline.main
 ```
 
-It supports five modes:
+它支持五种模式：
 
-- `diffusion-only`: generate reference motion and optionally render it.
-- `tracker-only`: track an existing reference through HoloMotion.
-- `sync`: diffusion plans a chunk, tracker executes the whole chunk, then the
-  next plan starts.
-- `async`: tracker keeps executing a reference buffer while diffusion replans
-  before the buffer runs out.
-- `offline-track`: generate a reference once, then track it offline.
+- `diffusion-only`：生成参考动作，并可选择渲染。
+- `tracker-only`：通过 HoloMotion 跟踪已有参考动作。
+- `sync`：扩散模型规划一个片段，跟踪器执行整个片段，随后开始下一次规划。
+- `async`：跟踪器持续执行参考缓冲区中的动作，扩散模型则在缓冲区耗尽前重新规划。
+- `offline-track`：生成一次参考动作，然后离线跟踪。
 
-## Condition Sequence
+## 条件序列
 
-Use `--condition-sequence` for chunk-level conditions:
+使用 `--condition-sequence` 指定片段级条件：
 
 ```text
 text: walk forward
@@ -29,12 +27,11 @@ text+audio: wave arms+/path/to/audio.wav
 text+humanref: imitate this+/path/to/ref.npz
 ```
 
-`text[5]` repeats the same text condition for five diffusion chunks. Audio
-chunks without `[N]` expand to the wav duration. When async runs with audio,
-the audio timeline advances according to tracker execution time, not planner
-latency.
+`text[5]` 会在五个扩散片段中重复相同的文本条件。未带 `[N]` 的音频片段会扩展至
+wav 时长。异步模式使用音频运行时，音频时间线按照跟踪器执行时间推进，
+而不是按照规划器延迟推进。
 
-## Diffusion Only
+## 仅扩散模式
 
 ```bash
 PYTHONPATH=src python -m omg.cli.pipeline.main \
@@ -47,9 +44,9 @@ PYTHONPATH=src python -m omg.cli.pipeline.main \
   --output-root outputs_pipeline
 ```
 
-The output directory contains generated reference motion and metadata.
+输出目录包含生成的参考动作和元数据。
 
-## Sync Mode
+## 同步模式
 
 ```bash
 PYTHONPATH=src python -m omg.cli.pipeline.main \
@@ -63,9 +60,9 @@ PYTHONPATH=src python -m omg.cli.pipeline.main \
   --output-root outputs_pipeline
 ```
 
-Sync replans after each tracker-executed chunk.
+同步模式会在跟踪器每执行完一个片段后重新规划。
 
-## Async Mode
+## 异步模式
 
 ```bash
 PYTHONPATH=src python -m omg.cli.pipeline.main \
@@ -80,30 +77,28 @@ PYTHONPATH=src python -m omg.cli.pipeline.main \
   --output-root outputs_pipeline
 ```
 
-Async mode starts replanning when the tracker reference buffer has at most
-`--async-replan-remaining-frames` frames remaining. TensorRT FP16 and DiT cache
-default to enabled in async mode.
+当跟踪器参考缓冲区剩余帧数不超过 `--async-replan-remaining-frames` 时，
+异步模式会开始重新规划。异步模式默认启用 TensorRT FP16 和 DiT 缓存。
 
-## Audio
+## 音频
 
-For wav-driven conditions:
+对于 wav 驱动的条件：
 
 ```bash
 --condition-sequence "audio: inputs/audio/demo.wav" --audio-type audio
 ```
 
-For precomputed wav features at startup:
+对于启动时预计算的 wav 特征：
 
 ```bash
 --condition-sequence "audio: inputs/audio/demo.wav" --audio-type feature
 ```
 
-Both forms take a wav path in the condition string.
+两种形式都在条件字符串中接收 wav 路径。
 
-## Export ONNX
+## 导出 ONNX
 
-The default export path is TensorRT-compatible and uses fixed batch size 2 for
-batched classifier-free guidance.
+默认导出路径兼容 TensorRT，并为批量无分类器引导使用固定批大小 2。
 
 ```bash
 PYTHONPATH=src python -m omg.cli.generation.export_onnx \
@@ -114,14 +109,12 @@ PYTHONPATH=src python -m omg.cli.generation.export_onnx \
   --device cuda
 ```
 
-The exporter writes a sidecar metadata file next to the ONNX model. The planner
-uses that metadata to recover sequence length, feature dimension, text/audio
-settings, representation, diffusion contract, and attention architecture.
+导出器会在 ONNX 模型旁写入元数据伴随文件。规划器使用这些元数据恢复序列长度、
+特征维度、文本/音频设置、表示、扩散约定和注意力架构。
 
-New checkpoints carry an architecture contract. Legacy checkpoints do not, and
-QK-normalization changes cannot be inferred from parameter names or shapes. A
-legacy export must therefore declare one of `none`, `cross-only`, `self-only`,
-or `self-and-cross` and instantiate the matching denoiser. Example:
+新检查点带有架构约定，而旧检查点没有；仅凭参数名称或形状无法推断 QK 归一化变更。
+因此，导出旧检查点时必须声明 `none`、`cross-only`、`self-only` 或
+`self-and-cross` 之一，并实例化匹配的去噪器。例如：
 
 ```bash
 PYTHONPATH=src python -m omg.cli.generation.export_onnx \
@@ -132,30 +125,29 @@ PYTHONPATH=src python -m omg.cli.generation.export_onnx \
   denoiser.cross_attention_qk_norm=true
 ```
 
-The exporter validates training-denoiser-to-wrapper and wrapper-to-ONNX numeric
-parity. It deletes the emitted graph and fails if either gate exceeds tolerance.
+导出器会验证训练去噪器与包装器之间，以及包装器与 ONNX 之间的数值一致性。
+任一检查超过容差时，它都会删除已生成的计算图并报错。
 
-## TensorRT Runtime
+## TensorRT 运行时
 
-The pipeline and realtime planner can run exported ONNX denoiser steps with
-ONNX Runtime TensorRT providers. Async mode enables TensorRT FP16 and DiT cache
-by default.
+流水线和实时规划器可以通过 ONNX Runtime TensorRT 提供程序运行导出的 ONNX
+去噪步骤。异步模式默认启用 TensorRT FP16 和 DiT 缓存。
 
-Common provider order:
+常用提供程序顺序：
 
 ```bash
 --providers TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider
 ```
 
-Realtime planner defaults:
+实时规划器默认设置：
 
-- TensorRT FP16 enabled.
-- DiT cache enabled.
-- TensorRT engine cache under `tensorrt_engine_cache/realtime_planner`.
+- 启用 TensorRT FP16。
+- 启用 DiT 缓存。
+- TensorRT 引擎缓存位于 `tensorrt_engine_cache/realtime_planner`。
 
-## Rendering
+## 渲染
 
-Common render flags:
+常用渲染参数：
 
 ```bash
 --video
@@ -166,5 +158,4 @@ Common render flags:
 --video-height 720
 ```
 
-`--follow-mode xy` is the default for pipeline rendering and is usually the
-most useful view for walking motions.
+`--follow-mode xy` 是流水线渲染的默认设置，通常也是观察行走动作最实用的视角。

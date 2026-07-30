@@ -1,9 +1,9 @@
-# Tracking
+# 跟踪
 
-OMG integrates HoloMotion as the downstream G1 motion tracker. Tracking
-can be used directly with a reference clip or as part of sync/async generation.
+OMG 将 HoloMotion 集成为下游 G1 动作跟踪器。跟踪既可以直接用于参考片段，
+也可以作为同步/异步生成的一部分。
 
-## Tracker Only
+## 仅跟踪器模式
 
 ```bash
 PYTHONPATH=src python -m omg.cli.tracking.holomotion \
@@ -15,12 +15,12 @@ PYTHONPATH=src python -m omg.cli.tracking.holomotion \
   --output outputs_tracking/reference_tracker.npz
 ```
 
-The input reference must contain `qpos_36`. If the reference file does not carry
-FPS metadata, pass `--reference-fps`.
+输入参考动作必须包含 `qpos_36`。如果参考文件不含 FPS 元数据，
+请传入 `--reference-fps`。
 
-## Pipeline Tracker Modes
+## 流水线跟踪器模式
 
-The pipeline command also exposes tracker modes:
+流水线命令也提供跟踪器模式：
 
 ```bash
 PYTHONPATH=src python -m omg.cli.pipeline.main \
@@ -31,12 +31,11 @@ PYTHONPATH=src python -m omg.cli.pipeline.main \
   --video
 ```
 
-Use `sync`, `async`, or `offline-track` when the reference should come from the
-diffusion planner.
+当参考动作应来自扩散规划器时，请使用 `sync`、`async` 或 `offline-track`。
 
-## Export Deployment Clips
+## 导出部署片段
 
-To convert a generated reference into HoloMotion deployment `motion_data` format:
+要将生成的参考动作转换为 HoloMotion 部署所用的 `motion_data` 格式：
 
 ```bash
 PYTHONPATH=src python -m omg.cli.tracking.export_holomotion_clip \
@@ -45,30 +44,29 @@ PYTHONPATH=src python -m omg.cli.tracking.export_holomotion_clip \
   --output /home/unitree/holomotion/deployment/unitree_g1_ros2_29dof/src/motion_data/01_reference.npz
 ```
 
-Restart the HoloMotion deployment process after changing deployment motion clips.
+更改部署动作片段后，请重启 HoloMotion 部署进程。
 
-## Providers
+## 提供程序
 
-Tracker provider default:
+跟踪器的默认提供程序：
 
 ```text
 TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider
 ```
 
-Use CUDA-only when TensorRT is not available:
+TensorRT 不可用时，请仅使用 CUDA：
 
 ```bash
 --providers CUDAExecutionProvider,CPUExecutionProvider
 ```
 
-## Outputs
+## 输出
 
-Tracker outputs include:
+跟踪器输出包括：
 
-- tracker-executed `qpos_36`
-- reference metadata
-- optional video
-- rollout timing and quality metadata when available
+- 跟踪器执行后的 `qpos_36`
+- 参考动作元数据
+- 可选视频
+- 可用时的执行过程时序和质量元数据
 
-Use tracker-executed output to evaluate how much of a generated reference is
-physically trackable by the downstream policy.
+使用跟踪器执行后的输出，评估生成的参考动作在多大程度上能够被下游策略实际跟踪。

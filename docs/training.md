@@ -1,23 +1,22 @@
-# Training
+# 训练
 
-Training uses PyTorch Lightning with Hydra configs under `configs/generation`.
-Download OMG-Data first and place it at `data/OMG-Data`, or set
-`OMG_DATA_ROOT` and `OMG_MATERIALIZED_ROOT`.
+训练使用 PyTorch Lightning，并采用 `configs/generation` 下的 Hydra 配置。
+请先下载 OMG-Data 并将其放在 `data/OMG-Data`，或设置
+`OMG_DATA_ROOT` 和 `OMG_MATERIALIZED_ROOT`。
 
-Text-conditioned runs also need the Hugging Face `t5-base` text encoder. The
-default config expects a local copy at:
+文本条件运行还需要 Hugging Face `t5-base` 文本编码器。默认配置要求本地副本位于：
 
 ```text
 ${OMG_MODELS_ROOT}/t5-base-local
 ```
 
-Use a different local path or Hugging Face model id with:
+可使用以下方式指定其他本地路径或 Hugging Face 模型 ID：
 
 ```bash
 model.text_encoder.model_name=/path/to/t5-base
 ```
 
-## Minimal Command
+## 最简命令
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
@@ -29,13 +28,13 @@ PYTHONPATH=src python -m omg.cli.generation.train \
   exp_name=50m_release_train
 ```
 
-The main config is:
+主配置为：
 
 ```text
 configs/generation/train.yaml
 ```
 
-Common overrides:
+常用覆盖项：
 
 ```bash
 trainer.max_steps=200000
@@ -44,9 +43,9 @@ callbacks.checkpoint.every_n_train_steps=2000
 data.loader_opts.train.batch_size=64
 ```
 
-## Model Sizes
+## 模型规模
 
-Experiment presets:
+实验预设：
 
 ```text
 configs/generation/exp/50m.yaml
@@ -56,11 +55,11 @@ configs/generation/exp/500m.yaml
 configs/generation/exp/1b.yaml
 ```
 
-Each experiment selects a Transformer denoiser size and training hyperparameters.
+每个实验都会选择一种 Transformer 去噪器规模和训练超参数。
 
-## Resume Training
+## 恢复训练
 
-Use `ckpt_path` for a full Lightning resume:
+使用 `ckpt_path` 完整恢复 Lightning 训练：
 
 ```bash
 PYTHONPATH=src python -m omg.cli.generation.train \
@@ -71,8 +70,8 @@ PYTHONPATH=src python -m omg.cli.generation.train \
   ckpt_path=outputs/50m_release_train/checkpoints/last.ckpt
 ```
 
-Use `init_weights_only_ckpt` only when initializing model weights without
-resuming optimizer, scheduler, dataloader, or global step state:
+仅在只初始化模型权重、而不恢复优化器、调度器、数据加载器或全局步数状态时，
+使用 `init_weights_only_ckpt`：
 
 ```bash
 PYTHONPATH=src python -m omg.cli.generation.train \
@@ -83,28 +82,28 @@ PYTHONPATH=src python -m omg.cli.generation.train \
   init_weights_only_ckpt=outputs/source/checkpoints/last.ckpt
 ```
 
-## W&B Logging
+## W&B 日志
 
 ```bash
 export WANDB_API_KEY="..."
 export WANDB_MODE=online
 ```
 
-Disable logging with:
+使用以下配置禁用日志：
 
 ```bash
 logger=none
 ```
 
-## Checkpoints
+## 检查点
 
-Find recent checkpoints:
+查找最近的检查点：
 
 ```bash
 find outputs/<exp_name>/checkpoints -maxdepth 1 -name "*.ckpt" | sort | tail -20
 ```
 
-Export from a checkpoint with:
+从检查点导出：
 
 ```bash
 PYTHONPATH=src python -m omg.cli.generation.export_onnx \
@@ -115,14 +114,13 @@ PYTHONPATH=src python -m omg.cli.generation.export_onnx \
   --device cuda
 ```
 
-## Validation
+## 验证
 
-Lightning validation runs according to `trainer.val_check_interval`. For quick
-debugging, reduce both validation and checkpoint intervals:
+Lightning 验证按照 `trainer.val_check_interval` 运行。快速调试时，
+可同时缩短验证间隔和检查点间隔：
 
 ```bash
 trainer.val_check_interval=200 callbacks.checkpoint.every_n_train_steps=200
 ```
 
-Use short debug runs only for code checks. Do not compare motion quality from
-very short runs.
+短时调试运行仅用于代码检查。不要比较极短运行所生成动作的质量。
