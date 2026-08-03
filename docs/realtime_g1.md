@@ -1,5 +1,7 @@
 # G1 实时部署
 
+Realtime dynamic commands: [docs/realtime_commands.md](realtime_commands.md)
+
 实时部署使用三个进程：
 
 1. G1 Orin 上的 HoloMotion 部署进程。

@@ -11,6 +11,12 @@ from typing import Any
 import numpy as np
 
 from omg.realtime.motion_buffer import ExecutedHistoryBuffer
+from omg.realtime.command_server import CommandServerConfig, DynamicCommandServer
+from omg.realtime.dynamic_condition import (
+    ConditionSnapshot,
+    DynamicConditionController,
+    compute_condition_audio_step_frames,
+)
 from omg.realtime.orin_client import RealtimeOrinBufferClient, RealtimeOrinBufferClientConfig
 from omg.realtime.status_log import append_jsonl
 from omg.tracking.holomotion.reference import body_angvel_from_quats, finite_difference, resample_qpos
@@ -127,12 +133,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--replan-remaining-frames", type=int, default=40)
     parser.add_argument(
         "--condition-sequence",
-        required=True,
+        default=None,
         help=(
             "Per-replan condition sequence sent to the planner, e.g. "
             "'text[5]: walk forward | text: turn right | audio: /path/song.wav'."
         ),
     )
+    parser.add_argument("--command-bind", default=None, help="Optional dynamic command REP bind URI.")
+    parser.add_argument("--initial-condition-sequence", default="text: stand still")
+    parser.add_argument("--planner-frames", type=int, default=60)
     parser.add_argument(
         "--condition-audio-step-frames",
         type=int,
@@ -173,9 +182,41 @@ def main() -> None:
         raise ValueError("--num-frames must be positive")
     if args.replan_remaining_frames < 0:
         raise ValueError("--replan-remaining-frames must be non-negative")
-    condition_sequence = str(args.condition_sequence).strip()
-    if not condition_sequence:
-        raise ValueError("--condition-sequence must be non-empty")
+    dynamic_enabled = args.command_bind is not None
+    if dynamic_enabled:
+        initial_condition_sequence = str(
+            args.condition_sequence
+            if args.condition_sequence is not None
+            else args.initial_condition_sequence
+        ).strip()
+        if not initial_condition_sequence:
+            raise ValueError("--initial-condition-sequence must be non-empty")
+        controller: DynamicConditionController | None = DynamicConditionController(
+            tracker_fps=float(args.tracker_fps),
+            initial_condition_sequence=initial_condition_sequence,
+        )
+        if args.condition_audio_step_frames is None:
+            condition_audio_step_frames = compute_condition_audio_step_frames(
+                planner_frames=int(args.planner_frames),
+                history_fps=float(args.history_fps),
+                tracker_fps=float(args.tracker_fps),
+                replan_remaining_frames=int(args.replan_remaining_frames),
+                audio_fps=float(args.audio_fps),
+            )
+            print(
+                f"[dynamic-condition] computed audio step frames={condition_audio_step_frames}",
+                flush=True,
+            )
+        else:
+            condition_audio_step_frames = int(args.condition_audio_step_frames)
+            if condition_audio_step_frames <= 0:
+                raise ValueError("--condition-audio-step-frames must be positive")
+    else:
+        initial_condition_sequence = str(args.condition_sequence or "").strip()
+        if not initial_condition_sequence:
+            raise ValueError("--condition-sequence must be non-empty when --command-bind is not set")
+        controller = None
+        condition_audio_step_frames = args.condition_audio_step_frames
     seed_qpos, seed_fps = _load_seed_motion(args.seed_motion, args.seed_fps)
     history_qpos = resample_qpos(seed_qpos, source_fps=seed_fps, target_fps=args.history_fps)
     history = ExecutedHistoryBuffer(target_fps=args.history_fps, max_frames=args.history_frames)
@@ -211,17 +252,50 @@ def main() -> None:
     cursor = 0
     replan_index = 0
     condition_session_id = uuid.uuid4().hex
+    active_plan_revision: int | None = None
+    command_server: DynamicCommandServer | None = None
 
-    def request_and_append(current_cursor: int) -> int:
+    if controller is not None:
+        command_server = DynamicCommandServer(
+            CommandServerConfig(bind=str(args.command_bind)),
+            controller,
+            status_callback=lambda event: append_jsonl(args.status_jsonl, event),
+        )
+        try:
+            command_server.start()
+        except BaseException:
+            publisher.close()
+            if sim_stream is not None:
+                sim_stream.close()
+            client.close()
+            raise
+
+    def update_dynamic_condition(current_cursor: int) -> None:
+        if controller is None:
+            return
+        event = controller.update_for_tracker_frame(int(current_cursor))
+        if event is not None:
+            append_jsonl(args.status_jsonl, event)
+
+    def request_and_append(current_cursor: int) -> tuple[int, int | None, bool]:
         nonlocal replan_index
-        condition_index = int(replan_index)
-        replan_index += 1
-        started = time.perf_counter()
-        response = client.request_plan(
-            tracker_frame=current_cursor,
-            qpos_36_history=history.history(args.history_frames),
-            history_fps=float(args.history_fps),
-            metadata={
+        snapshot: ConditionSnapshot | None = None
+        if controller is not None:
+            snapshot = controller.snapshot_for_replan(current_tracker_frame=current_cursor)
+            condition_sequence = snapshot.condition_sequence
+            condition_index = int(snapshot.condition_index)
+            request_metadata = snapshot.metadata(
+                audio_fps=float(args.audio_fps),
+                tracker_fps=float(args.tracker_fps),
+                audio_type=("audio" if snapshot.command_type == "audio" else str(args.audio_type)),
+                audio_feature_type=str(args.audio_feature_type),
+                condition_audio_step_frames=int(condition_audio_step_frames),
+            )
+            request_metadata["dry_run"] = True
+        else:
+            condition_sequence = initial_condition_sequence
+            condition_index = int(replan_index)
+            request_metadata = {
                 "dry_run": True,
                 "condition_sequence": condition_sequence,
                 "condition_index": condition_index,
@@ -231,16 +305,34 @@ def main() -> None:
                 "tracker_fps": float(args.tracker_fps),
                 "audio_type": str(args.audio_type),
                 "audio_feature_type": str(args.audio_feature_type),
-                "condition_audio_step_frames": args.condition_audio_step_frames,
-            },
+                "condition_audio_step_frames": condition_audio_step_frames,
+            }
+        started = time.perf_counter()
+        client.begin_request(
+            tracker_frame=current_cursor,
+            qpos_36_history=history.history(args.history_frames),
+            history_fps=float(args.history_fps),
+            metadata=request_metadata,
         )
+        if snapshot is not None:
+            controller.mark_replan_submitted(snapshot)
+        else:
+            replan_index += 1
+        response = client.poll_response(timeout_ms=int(args.timeout_ms))
+        if response is None:
+            raise TimeoutError(f"Timed out waiting {int(args.timeout_ms)}ms for realtime plan response")
         latency = time.perf_counter() - started
         elapsed_frames = int(math.floor(latency * float(args.tracker_fps) + 1e-9))
         bridge_frames = min(elapsed_frames, max(0, client.buffer.remaining(current_cursor)))
         if bridge_frames > 0:
             execute_frames(current_cursor, bridge_frames)
             current_cursor += bridge_frames
+        update_dynamic_condition(current_cursor)
         client.append_response(response, current_tracker_frame=current_cursor)
+        command_revision = None if snapshot is None else int(snapshot.revision)
+        stale_command = bool(
+            snapshot is not None and command_revision != controller.current_revision
+        )
         transport = response.metadata.get("realtime_transport", {})
         event = {
             "kind": "replan",
@@ -257,6 +349,14 @@ def main() -> None:
             "prompt": response.prompt,
             "condition_sequence": condition_sequence,
             "condition_index": condition_index,
+            "command_id": None if snapshot is None else snapshot.command_id,
+            "command_type": None if snapshot is None else snapshot.command_type,
+            "command_revision": command_revision,
+            "condition_session_id": condition_session_id if snapshot is None else snapshot.condition_session_id,
+            "audio_duration_seconds": None if snapshot is None else snapshot.audio_duration_seconds,
+            "audio_start_tracker_frame": None if snapshot is None else snapshot.audio_start_tracker_frame,
+            "audio_end_tracker_frame": None if snapshot is None else snapshot.audio_end_tracker_frame,
+            "stale_command": stale_command,
             "response_condition": response.metadata.get("realtime_condition"),
         }
         events.append(event)
@@ -264,6 +364,8 @@ def main() -> None:
         print(
             f"[dry-run replan {response.plan_id:04d}] request={response.request_tracker_frame:05d} "
             f"append={current_cursor:05d} condition={condition_index:04d} prompt={response.prompt!r} "
+            f"command_id={event['command_id']} command_type={event['command_type']} "
+            f"command_revision={event['command_revision']} stale_command={stale_command} "
             f"latency={latency * 1000.0:.3f}ms "
             f"server={float(transport.get('server_plan_ms', response.planning_latency_seconds * 1000.0)):.3f}ms "
             f"net_queue={float(transport.get('client_network_queue_total_estimate_ms', 0.0)):.3f}ms "
@@ -271,7 +373,7 @@ def main() -> None:
             f"elapsed={elapsed_frames} buffer={client.buffer.frames}",
             flush=True,
         )
-        return current_cursor
+        return current_cursor, command_revision, stale_command
 
     def execute_frames(start_cursor: int, frames: int) -> None:
         chunk = client.buffer.slice(start_cursor, frames)
@@ -280,11 +382,16 @@ def main() -> None:
             frame_index = start_cursor + local_idx
             publisher.publish(obs, frame_index=frame_index)
             if sim_stream is not None:
+                active_condition = (
+                    controller.snapshot().condition_sequence
+                    if controller is not None
+                    else initial_condition_sequence
+                )
                 sim_stream.update(
                     chunk[local_idx],
                     frame_index=frame_index,
                     overlay_lines=[
-                        f"condition: {condition_sequence}",
+                        f"condition: {active_condition}",
                         f"tracker frame: {frame_index}",
                         f"buffer remaining: {client.buffer.remaining(frame_index)}",
                     ],
@@ -296,21 +403,41 @@ def main() -> None:
 
     interrupted = False
     try:
-        cursor = request_and_append(0)
+        cursor, active_plan_revision, stale_command = request_and_append(0)
+        while stale_command:
+            print(
+                "[dynamic-condition] stale plan completed; scheduling current command immediately",
+                flush=True,
+            )
+            cursor, active_plan_revision, stale_command = request_and_append(cursor)
         while args.continuous or cursor < int(args.num_frames):
+            update_dynamic_condition(cursor)
             remaining_total = math.inf if args.continuous else int(args.num_frames) - cursor
             remaining_buffer = client.buffer.remaining(cursor)
             if remaining_buffer <= 0:
                 raise RuntimeError(f"Motion buffer underrun at tracker frame {cursor}")
-            if remaining_buffer <= int(args.replan_remaining_frames):
-                cursor = request_and_append(cursor)
+            revision_changed = bool(
+                controller is not None and controller.current_revision != active_plan_revision
+            )
+            if revision_changed or remaining_buffer <= int(args.replan_remaining_frames):
+                cursor, active_plan_revision, stale_command = request_and_append(cursor)
+                while stale_command:
+                    print(
+                        "[dynamic-condition] stale plan completed; scheduling current command immediately",
+                        flush=True,
+                    )
+                    cursor, active_plan_revision, stale_command = request_and_append(cursor)
                 remaining_total = math.inf if args.continuous else int(args.num_frames) - cursor
                 remaining_buffer = client.buffer.remaining(cursor)
                 if remaining_total <= 0:
                     break
-            step_capacity = max(1, remaining_buffer - int(args.replan_remaining_frames))
+            step_capacity = (
+                1
+                if controller is not None
+                else max(1, remaining_buffer - int(args.replan_remaining_frames))
+            )
             step_frames = step_capacity if args.continuous else min(int(remaining_total), step_capacity)
-            if remaining_total <= remaining_buffer:
+            if controller is None and remaining_total <= remaining_buffer:
                 step_frames = int(remaining_total)
             execute_frames(cursor, step_frames)
             cursor += step_frames
@@ -318,6 +445,8 @@ def main() -> None:
         interrupted = True
         print(f"interrupted_at_frame={cursor}; saving partial dry-run output", flush=True)
     finally:
+        if command_server is not None:
+            command_server.close()
         publisher.close()
         if sim_stream is not None:
             sim_stream.close()
@@ -336,7 +465,7 @@ def main() -> None:
         latest_obs=_qpos_to_latest_obs(executed, fps=float(args.tracker_fps)) if executed.shape[0] else np.zeros((0, 65), dtype=np.float32),
         fps=np.asarray([float(args.tracker_fps)], dtype=np.float32),
         events=np.asarray([json.dumps(events, sort_keys=True)]),
-        condition_sequence=np.asarray([condition_sequence], dtype=np.str_),
+        condition_sequence=np.asarray([initial_condition_sequence], dtype=np.str_),
         continuous=np.asarray([bool(args.continuous)]),
         interrupted=np.asarray([bool(interrupted)]),
     )
