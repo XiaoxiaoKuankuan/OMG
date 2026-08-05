@@ -33,6 +33,10 @@ export OMG_BUMI_DATA_ROOT=/data0/user/liwei/OMG_data/OMG-BUMI-Data
 export BUMI_DATA_ROOT="$OMG_BUMI_DATA_ROOT"
 export OMG_BUMI_MATERIALIZED_ROOT=/data0/user/liwei/OMG_data/OMG-BUMI-Materialized
 export OMG_BUMI_REPO_ID=local/OMG-BUMI-Data
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 ```
 
 `OMG_BUMI_DATA_REVISION` 必须是 40 位十六进制转换版本标识；manifest SHA 必须来自新 BUMI manifest：
@@ -57,7 +61,9 @@ python scripts/convert_omg_lerobot_to_bumi.py \
   --target-config config/robot/noetix_bumi_v1_3.yaml \
   --quality-config config/quality/omg_bumi.yaml \
   --split train --split val --split test \
-  --workers 16
+  --workers 16 \
+  --episodes-per-task 32 \
+  --mp-start-method spawn
 
 python scripts/finalize_bumi_lerobot.py \
   --stage-root "$BUMI_STAGE_ROOT" \
@@ -68,14 +74,26 @@ python scripts/finalize_bumi_lerobot.py \
   --source-manifest-sha256 be443885018180dda0f88ed874efc15cb3776a91148148baf49001d56a5ec855 \
   --source-config config/robot/g1.yaml \
   --target-config config/robot/noetix_bumi_v1_3.yaml \
-  --quality-config config/quality/omg_bumi.yaml
+  --quality-config config/quality/omg_bumi.yaml \
+  --max-frames-per-data-file 1000000 \
+  --data-files-per-chunk 1000 \
+  --episodes-per-meta-file 10000 \
+  --row-group-size 65536 \
+  --compression zstd
 
 python scripts/validate_bumi_lerobot.py \
   --dataset-root "$BUMI_DATA_ROOT" \
   --output /home/weili/OMG/outputs/integration/dataset_validation.json
+
+HF_HUB_OFFLINE=1 python scripts/validate_bumi_lerobot_official.py \
+  --dataset-root "$BUMI_DATA_ROOT" \
+  --repo-id local/OMG-BUMI-Data \
+  --output /home/weili/OMG/outputs/integration/dataset_validation_official.json
 ```
 
-源数据目录只读；worker 仅原子写独立 staging artifact，最终 Parquet 仅由 finalize 单进程写入。
+源数据目录只读；worker 仅原子写独立 staging artifact，最终 Parquet 仅由 finalize 单进程写入。每个 worker 只初始化一次 reader、G1/BUMI MuJoCo 模型、IK 和质量评估器；episode 之间仍完整 reset IK。finalizer 两遍扫描 staging，逐 episode 写 data/meta shard，并以 batch Welford 计算统计量，不将全量 state/action 驻留内存。frame `task_index` 按任务文本的确定性首次出现顺序重新编号。
+
+新 finalizer 要求 staging 中存在明确的源 `task_index→text` 映射；早期版本 artifact 需要用当前 converter 重新生成，不能直接混入新数据集。
 
 ## 导出并验证 BUMI FK/渲染资产
 
@@ -219,6 +237,11 @@ python tools/run_bumi_mini_integration.py \
   --retarget-python "$ROBOT_RETARGET_PYTHON" \
   --t5-model "$OMG_T5_MODEL" \
   --workers 1 \
+  --episodes-per-task 32 \
+  --max-frames-per-data-file 1000000 \
+  --data-files-per-chunk 1000 \
+  --episodes-per-meta-file 10000 \
+  --row-group-size 65536 \
   --device cuda
 ```
 
@@ -229,6 +252,7 @@ python tools/run_bumi_mini_integration.py \
 ```text
 outputs/integration/retarget_report.json
 outputs/integration/dataset_validation.json
+outputs/integration/dataset_validation_official.json
 outputs/integration/fk_parity.json
 outputs/integration/train_smoke.log
 outputs/integration/generation_samples/
@@ -249,3 +273,23 @@ CUDA_VISIBLE_DEVICES=0 python -m omg.cli.generation.train \
 ```
 
 失败 episode 查询 `conversion.sqlite3`；临时错误用相同输入身份加 `--retry-failed`。配置、代码或源 release 变化时使用新的 staging 根目录。
+
+## 生产并行 benchmark
+
+不要直接使用 `workers=100`。先固定同一批 100～500 个完整 episode 和同一套配置，分别以 `workers=1,4,8,16,32` 写入互不相同的 staging 根目录：
+
+```bash
+for workers in 1 4 8 16 32; do
+  /usr/bin/time -v "$ROBOT_RETARGET_PYTHON" \
+    /home/weili/robot_retarget/scripts/convert_omg_lerobot_to_bumi.py \
+    --source-root "$SOURCE_OMG_DATA" \
+    --stage-root "/path/to/benchmark/w${workers}" \
+    --episode-list /path/to/fixed_100_500_episodes.txt \
+    --workers "$workers" \
+    --episodes-per-task 32 \
+    --mp-start-method spawn \
+    2>&1 | tee "/path/to/benchmark/w${workers}.log"
+done
+```
+
+每档记录 frames/s、episodes/hour、峰值 RSS、源盘读取吞吐、失败率、不同 `worker_initialization_id` 的数量和模型加载次数。先根据源盘吞吐与峰值内存选择并行度，再运行全量转换；上述 100～500 episode benchmark 尚未在当前开发机执行。

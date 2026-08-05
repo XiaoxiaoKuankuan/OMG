@@ -120,6 +120,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--integration-root", type=Path, default=repo_root / "outputs/integration")
     parser.add_argument("--t5-model", type=Path, default=os.environ.get("OMG_T5_MODEL"))
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--episodes-per-task", type=int, default=32)
+    parser.add_argument("--max-frames-per-data-file", type=int, default=1_000_000)
+    parser.add_argument("--data-files-per-chunk", type=int, default=1000)
+    parser.add_argument("--episodes-per-meta-file", type=int, default=10_000)
+    parser.add_argument("--row-group-size", type=int, default=65_536)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--train-steps", type=int, default=50)
     parser.add_argument("--overfit-samples", type=int, default=64)
@@ -138,8 +143,17 @@ def main() -> None:
         raise SystemExit("--bundle or OMG_BUMI_DEV_BUNDLE is required")
     if not args.retarget_python:
         raise SystemExit("--retarget-python or ROBOT_RETARGET_PYTHON is required")
-    if args.workers <= 0 or args.generation_count <= 0:
-        raise SystemExit("--workers and --generation-count must be positive")
+    positive = (
+        "workers",
+        "generation_count",
+        "episodes_per_task",
+        "max_frames_per_data_file",
+        "data_files_per_chunk",
+        "episodes_per_meta_file",
+        "row_group_size",
+    )
+    if any(getattr(args, name) <= 0 for name in positive):
+        raise SystemExit("Worker, batching, sharding, and generation values must be positive")
     if (not args.skip_train or not args.skip_overfit or not args.skip_generate) and args.t5_model is None:
         raise SystemExit("--t5-model or OMG_T5_MODEL is required for train/generate stages")
 
@@ -162,6 +176,13 @@ def main() -> None:
         ["git", "-C", str(retarget_root), "rev-parse", "HEAD"], text=True
     ).strip()
     env = dict(os.environ)
+    for variable in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        env.setdefault(variable, "1")
     env.update(
         {
             "PYTHONPATH": str(repo_root / "src"),
@@ -186,6 +207,7 @@ def main() -> None:
         "--source-config", retarget_root / "config/robot/g1.yaml",
         "--target-config", retarget_root / "config/robot/noetix_bumi_v1_3.yaml",
         "--quality-config", retarget_root / "config/quality/omg_bumi.yaml",
+        "--episodes-per-task", str(args.episodes_per_task),
     ]
     runner.run([*common_convert, "--max-episodes", "1", "--workers", "1"], cwd=retarget_root)
     runner.run(
@@ -208,6 +230,10 @@ def main() -> None:
             "--source-config", retarget_root / "config/robot/g1.yaml",
             "--target-config", retarget_root / "config/robot/noetix_bumi_v1_3.yaml",
             "--quality-config", retarget_root / "config/quality/omg_bumi.yaml",
+            "--max-frames-per-data-file", str(args.max_frames_per_data_file),
+            "--data-files-per-chunk", str(args.data_files_per_chunk),
+            "--episodes-per-meta-file", str(args.episodes_per_meta_file),
+            "--row-group-size", str(args.row_group_size),
             "--overwrite",
         ],
         cwd=retarget_root,
@@ -218,6 +244,16 @@ def main() -> None:
             retarget_root / "scripts/validate_bumi_lerobot.py",
             "--dataset-root", dataset_root,
             "--output", integration_root / "dataset_validation.json",
+        ],
+        cwd=retarget_root,
+    )
+    runner.run(
+        [
+            args.retarget_python,
+            retarget_root / "scripts/validate_bumi_lerobot_official.py",
+            "--dataset-root", dataset_root,
+            "--repo-id", "local/OMG-BUMI-Mini",
+            "--output", integration_root / "dataset_validation_official.json",
         ],
         cwd=retarget_root,
     )
