@@ -204,6 +204,26 @@ export OMG_BUMI_DEV_BUNDLE=/path/to/omg_bumi_dev_bundle
 test -e "$OMG_BUMI_DEV_BUNDLE"
 ```
 
+可用集成执行器按规定顺序生成全部报告（`ROBOT_RETARGET_PYTHON` 必须指向安装了 robot_retarget 依赖的解释器）：
+
+```bash
+cd /home/weili/OMG
+source .venv/bin/activate
+
+export ROBOT_RETARGET_PYTHON=/absolute/path/to/robot_retargeter/bin/python
+export OMG_T5_MODEL=/home/weili/OMG_models/t5-base-local
+
+python tools/run_bumi_mini_integration.py \
+  --bundle "$OMG_BUMI_DEV_BUNDLE" \
+  --robot-retarget-root /home/weili/robot_retarget \
+  --retarget-python "$ROBOT_RETARGET_PYTHON" \
+  --t5-model "$OMG_T5_MODEL" \
+  --workers 1 \
+  --device cuda
+```
+
+执行器支持目录或单个 zip/tar bundle，校验 archive SHA 后解压；重复运行会复用 episode staging。`--dry-run` 只打印命令，不表示集成已通过；`--skip-train`、`--skip-overfit`、`--skip-generate` 仅用于分段诊断。
+
 在独立临时目录依次执行：解压 `source_mini`；单 worker `--max-episodes 1`；同一 staging resume 到 `--max-episodes 32`；finalize；validate；OMG loader；materialize；compute_stats；50-step smoke；限制 32～128 个样本过拟合；以 5 个 seed/history index 生成并渲染。保留：
 
 ```text

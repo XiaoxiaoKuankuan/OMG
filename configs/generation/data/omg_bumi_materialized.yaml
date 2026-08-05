@@ -11,7 +11,7 @@ dataset_opts:
       source_repo_id: ${oc.env:OMG_BUMI_REPO_ID,local/OMG-BUMI-Data}
       source_revision: ${oc.env:OMG_BUMI_DATA_REVISION,0000000000000000000000000000000000000000}
       kinematics_path: assets/robots/bumi/bumi_kinematics.json
-      kinematics_sha256: 1b835ea62af1445c0c020ddc1ea232b89e4e7e5fe77ebad5aa88f61da60a5605
+      kinematics_sha256: ${oc.env:OMG_BUMI_KINEMATICS_SHA256,1b835ea62af1445c0c020ddc1ea232b89e4e7e5fe77ebad5aa88f61da60a5605}
       representation_name: bumi_rot6d_93d
       split: train
   val:

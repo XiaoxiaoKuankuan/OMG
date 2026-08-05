@@ -57,6 +57,8 @@ warning 来自单元测试直接调用未绑定 Trainer 的 Lightning `self.log(
 
 所以 `outputs/integration/retarget_report.json`、`dataset_validation.json`、`train_smoke.log` 和 `generation_samples/` 尚未由真实 bundle 产生。完整执行命令见 `docs/bumi_native_training.md`。
 
+`tools/run_bumi_mini_integration.py` 已实现可恢复的真实 mini 编排和规定产物路径，但由于 bundle 缺失，本机只验证了入口解析/单测，没有把 dry-run 当作实际集成结果。
+
 ## 已知风险
 
 - 全量 IK 失败率和质量阈值只能在官方数据上校准；严格模式拒绝异常 episode 是设计行为。
