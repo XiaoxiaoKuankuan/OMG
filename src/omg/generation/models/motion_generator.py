@@ -965,7 +965,7 @@ class MotionGenerator(pl.LightningModule):
                 cfg_human_scale=cfg_human_scale,
             )
             decoded = self.representation.decode(future_norm)
-            qpos = self.representation.compose_qpos_36(decoded, canon_root_pos, canon_root_quat)
+            qpos = self.representation.compose_qpos(decoded, canon_root_pos, canon_root_quat)
             features = self.representation.denormalize_features(future_norm)
             qpos_chunks.append(qpos)
             feature_chunks.append(features)
@@ -981,7 +981,10 @@ class MotionGenerator(pl.LightningModule):
             frames_left -= curr_len
             frame_offset += curr_len
 
-        return {
+        result = {
             "motion_features": torch.cat(feature_chunks, dim=1),
-            "qpos_36": torch.cat(qpos_chunks, dim=1),
+            "qpos": torch.cat(qpos_chunks, dim=1),
         }
+        if getattr(self.representation, "robot_name", "g1").lower() == "g1":
+            result["qpos_36"] = result["qpos"]
+        return result

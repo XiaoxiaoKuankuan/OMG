@@ -141,7 +141,7 @@ class MotionLoss(nn.Module):
     def _decode_fk(self, pred, batch: dict, representation, valid: torch.Tensor) -> tuple[torch.Tensor, dict, object]:
         canon_root_pos = batch["canon_root_pos"].to(valid.device)
         canon_root_quat = batch["canon_root_quat"].to(valid.device)
-        pred_qpos = representation.codec.decode_to_world_qpos36(
+        pred_qpos = representation.codec.decode_to_world_qpos(
             pred,
             anchor_root_pos=canon_root_pos,
             anchor_root_quat=canon_root_quat,

@@ -13,15 +13,17 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from omg.core.tensor import get_valid_mask, repeat_to_max_len
-from omg.motion.feature_codec import G1MotionFeatureCodec
+from omg.motion.feature_codec import G1MotionFeatureCodec, MotionFeatureCodec
+from omg.robots.bumi.kinematics import BumiKinematics
 from omg.robots.g1.kinematics import G1Kinematics
 from omg.utils.rotation_conversions import standardize_quaternion
 
 
-class EpisodeCachedG1MotionDataset(Dataset):
+class EpisodeCachedMotionDataset(Dataset):
     """Read exact windows from frame-level episode kinematics caches."""
 
-    FORMAT = "omg.episode_cache.g1_motion.v2"
+    FORMAT = "omg.episode_cache.v3"
+    LEGACY_G1_FORMAT = "omg.episode_cache.g1_motion.v2"
 
     def __init__(
         self,
@@ -33,6 +35,11 @@ class EpisodeCachedG1MotionDataset(Dataset):
         shard_cache_size: int = 4,
         episode_cache_size: int = 64,
         kinematics_path: str = "assets/robots/g1/g1_kinematics.json",
+        robot_name: str = "g1",
+        state_dim: int = 36,
+        feature_dim: int | None = None,
+        kinematics_sha256: str | None = None,
+        representation_name: str | None = None,
     ) -> None:
         super().__init__()
         self.root = Path(root)
@@ -44,6 +51,32 @@ class EpisodeCachedG1MotionDataset(Dataset):
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         if summary.get("format") != self.FORMAT:
             raise ValueError(f"Unsupported episode-cache format: {summary.get('format')!r}")
+        self.robot_name = str(summary.get("robot_name", robot_name)).lower()
+        self.state_dim = int(summary.get("state_dim", state_dim))
+        expected_dim = {"g1": 36, "bumi": 28}.get(self.robot_name)
+        if expected_dim is None or self.state_dim != expected_dim:
+            raise ValueError(
+                f"Episode cache robot/state mismatch: robot={self.robot_name!r} state_dim={self.state_dim}"
+            )
+        self.feature_dim = int(summary.get("feature_dim", feature_dim or 0))
+        self.kinematics_sha256 = str(summary.get("kinematics_sha256", ""))
+        self.representation_name = str(summary.get("representation_name", representation_name or ""))
+        if self.FORMAT == "omg.episode_cache.v3":
+            for name, value in (
+                ("feature_dim", self.feature_dim),
+                ("kinematics_sha256", self.kinematics_sha256),
+                ("representation_name", self.representation_name),
+            ):
+                if not value:
+                    raise ValueError(f"Episode cache v3 summary is missing {name}")
+            if feature_dim is not None and self.feature_dim != int(feature_dim):
+                raise ValueError(
+                    f"Episode cache feature_dim mismatch: cache={self.feature_dim} expected={feature_dim}"
+                )
+            if kinematics_sha256 is not None and self.kinematics_sha256 != str(kinematics_sha256):
+                raise ValueError("Episode cache kinematics_sha256 mismatch")
+            if representation_name is not None and self.representation_name != str(representation_name):
+                raise ValueError("Episode cache representation_name mismatch")
         self.source_repo_id = str(summary.get("source_repo_id", ""))
         self.source_revision = str(summary.get("source_revision", ""))
         expected_identity = (str(source_repo_id), str(source_revision))
@@ -64,8 +97,15 @@ class EpisodeCachedG1MotionDataset(Dataset):
         self.human_motion_dim = int(summary.get("human_motion_dim", 66))
         self.shard_cache_size = max(1, int(shard_cache_size))
         self.episode_cache_size = max(1, int(episode_cache_size))
-        self.kinematics = G1Kinematics(kinematics_path=kinematics_path)
-        self.codec = G1MotionFeatureCodec(
+        if self.robot_name == "g1":
+            self.kinematics = G1Kinematics(kinematics_path=kinematics_path)
+            codec_class = G1MotionFeatureCodec
+        elif self.robot_name == "bumi":
+            self.kinematics = BumiKinematics(kinematics_path=kinematics_path)
+            codec_class = MotionFeatureCodec
+        else:  # pragma: no cover - guarded above
+            raise ValueError(f"Unsupported robot_name={self.robot_name!r}")
+        self.codec = codec_class(
             self.kinematics,
             num_prev_states=self.num_prev_states,
             canonical_frame_idx=int(summary["canonical_frame_idx"]),
@@ -89,6 +129,10 @@ class EpisodeCachedG1MotionDataset(Dataset):
         self.uses_exhaustive_train_windows = True
         self._shard_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
         self._episode_cache: OrderedDict[int, dict[str, torch.Tensor]] = OrderedDict()
+        if self.feature_dim and self.codec.feature_dim != self.feature_dim:
+            raise ValueError(
+                f"Episode cache feature_dim={self.feature_dim} does not match codec={self.codec.feature_dim}"
+            )
 
     def __len__(self) -> int:
         return self.num_samples
@@ -99,9 +143,11 @@ class EpisodeCachedG1MotionDataset(Dataset):
             self._shard_cache.move_to_end(shard_id)
             return cached
         shard_root = self.split_root / "shards" / f"shard_{shard_id:05d}"
+        qpos_file_key = "qpos_36" if self.FORMAT == self.LEGACY_G1_FORMAT else "qpos"
         loaded = {
-            key: np.load(shard_root / f"{key}.npy", mmap_mode="r")
-            for key in ("qpos_36", "body_pos_w", "body_quat_w")
+            "qpos_36": np.load(shard_root / f"{qpos_file_key}.npy", mmap_mode="r"),
+            "body_pos_w": np.load(shard_root / "body_pos_w.npy", mmap_mode="r"),
+            "body_quat_w": np.load(shard_root / "body_quat_w.npy", mmap_mode="r"),
         }
         optional_keys = []
         if self.use_audio:
@@ -227,11 +273,14 @@ class EpisodeCachedG1MotionDataset(Dataset):
                 fps=fps,
                 valid_mask=values["valid_mask"],
             )
-            return {
+            encoded = {
                 "motion_features": self.codec.assemble_features(components),
-                "qpos_36": values["qpos_36"],
+                "qpos": values["qpos_36"],
                 "valid_mask": values["valid_mask"],
             }
+            if self.robot_name == "g1":
+                encoded["qpos_36"] = values["qpos_36"]
+            return encoded
 
         for episode_index in range(episode_begin, episode_end):
             episode = {
@@ -326,10 +375,11 @@ class EpisodeCachedG1MotionDataset(Dataset):
         if self.use_human_motion:
             human_motion[:valid_len] = episode["human_motion"][start:end]
             has_human_motion[:valid_len] = episode["has_human_motion"][start:end]
-        return {
+        result = {
             "length": torch.tensor(valid_len, dtype=torch.long),
             "fps": torch.tensor(self.default_fps, dtype=torch.float32),
-            "qpos_36": self._pad(qpos_36, self.window_size),
+            "qpos": self._pad(qpos_36, self.window_size),
+            "prev_qpos": qpos_all[history_indices],
             "body_pos_w": self._pad(body_pos_w, self.window_size),
             "body_quat_w": self._pad(body_quat_w, self.window_size),
             "audio_features": audio_features,
@@ -355,5 +405,35 @@ class EpisodeCachedG1MotionDataset(Dataset):
                 "episode_index": episode_index,
                 "window_start": start,
                 "split": self.split,
+                "robot_name": self.robot_name,
             },
         }
+        if self.robot_name == "g1":
+            result["qpos_36"] = result["qpos"]
+            result["prev_qpos_36"] = result["prev_qpos"]
+        return result
+
+
+class EpisodeCachedG1MotionDataset(EpisodeCachedMotionDataset):
+    """Read legacy G1 v2 caches without changing their on-disk contract."""
+
+    FORMAT = EpisodeCachedMotionDataset.LEGACY_G1_FORMAT
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("robot_name", "g1")
+        kwargs.setdefault("state_dim", 36)
+        kwargs.setdefault("kinematics_path", "assets/robots/g1/g1_kinematics.json")
+        super().__init__(*args, **kwargs)
+
+
+class EpisodeCachedBumiMotionDataset(EpisodeCachedMotionDataset):
+    """Read BUMI-native episode cache v3 shards."""
+
+    FORMAT = EpisodeCachedMotionDataset.FORMAT
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("robot_name", "bumi")
+        kwargs.setdefault("state_dim", 28)
+        kwargs.setdefault("feature_dim", 93)
+        kwargs.setdefault("kinematics_path", "assets/robots/bumi/bumi_kinematics.json")
+        super().__init__(*args, **kwargs)

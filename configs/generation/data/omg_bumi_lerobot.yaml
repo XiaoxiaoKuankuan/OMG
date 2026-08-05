@@ -1,0 +1,38 @@
+_target_: omg.data.datamodule.GenerationDataModule
+limit_each_trainset: null
+train_subset_ratio: null
+rotation_representation: ${representation.rotation_representation}
+
+dataset_opts:
+  train:
+    omg_bumi_train: &dataset_defaults
+      _target_: omg.data.lerobot_dataset.LeRobotBumiMotionDataset
+      dataset_root: ${paths.bumi_data_root}
+      repo_id: ${oc.env:OMG_BUMI_REPO_ID,local/OMG-BUMI-Data}
+      revision: ${oc.env:OMG_BUMI_DATA_REVISION,0000000000000000000000000000000000000000}
+      manifest_sha256: ${oc.env:OMG_BUMI_MANIFEST_SHA256,0000000000000000000000000000000000000000000000000000000000000000}
+      manifest_filename: omg_bumi_manifest.json
+      kinematics_path: assets/robots/bumi/bumi_kinematics.json
+      sequence_duration: 2.0
+      num_prev_states: ${representation.num_prev_states}
+      canonical_frame_idx: ${representation.canonical_frame_idx}
+      fps: 30.0
+      use_text: true
+      use_audio: false
+      audio_dim: 35
+      use_human_motion: false
+      human_motion_dim: 66
+      split: train
+  val:
+    omg_bumi_val:
+      <<: *dataset_defaults
+      split: val
+  test:
+    omg_bumi_test:
+      <<: *dataset_defaults
+      split: test
+
+loader_opts:
+  train: {batch_size: 96, num_workers: 0, prefetch_factor: null}
+  val: {batch_size: 16, num_workers: 2, prefetch_factor: 1}
+  test: {batch_size: 16, num_workers: 2, prefetch_factor: 1}

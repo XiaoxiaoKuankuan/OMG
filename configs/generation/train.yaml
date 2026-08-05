@@ -17,6 +17,7 @@ task: fit
 ckpt_path: null
 init_weights_only_ckpt: null
 init_weights_strict: true
+init_weights_adapter: null
 exp_name: unset
 output_dir: ${paths.output_root}/${exp_name}
 checkpoint_io:

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from omg.robots.g1.kinematics import G1Kinematics
+from omg.robots.base import RobotKinematics
 from omg.utils.rotation_conversions import (
     axis_angle_to_quaternion,
     matrix_to_quaternion,
@@ -28,10 +28,10 @@ class MotionComponents:
     body_link_pos_local: torch.Tensor
 
 
-class G1MotionFeatureCodec:
+class MotionFeatureCodec:
     def __init__(
         self,
-        kinematics: G1Kinematics,
+        kinematics: RobotKinematics,
         num_prev_states: int = 2,
         canonical_frame_idx: int | None = None,
         rotation_representation: str = "quat",
@@ -46,7 +46,9 @@ class G1MotionFeatureCodec:
             raise ValueError(
                 f"canonical_frame_idx must be in [0, {self.num_prev_states}), got {self.canonical_frame_idx}"
             )
-        self.num_body_links = self.kinematics.num_bodies - 1
+        self.num_body_links = int(
+            getattr(self.kinematics, "num_feature_bodies", self.kinematics.num_bodies - 1)
+        )
         self.rotation_representation = self._normalize_rotation_representation(rotation_representation)
         self.rot6d_gradient_mode = self._normalize_rot6d_gradient_mode(rot6d_gradient_mode)
         self.root_rot_dim = {"quat": 4, "rot6d": 6}[self.rotation_representation]
@@ -169,18 +171,26 @@ class G1MotionFeatureCodec:
             body_link_pos_local=body_link_pos_local,
         )
 
+    def _split_qpos(self, qpos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        expected_dim = int(getattr(self.kinematics, "qpos_dim", 7 + self.kinematics.num_joints))
+        if qpos.shape[-1] != expected_dim:
+            raise ValueError(f"Expected qpos last dim {expected_dim}, got {qpos.shape}")
+        root_pos = qpos[..., :3]
+        root_quat = F.normalize(qpos[..., 3:7], dim=-1)
+        root_quat = standardize_quaternion(root_quat)
+        joint_dof = qpos[..., 7:]
+        return root_pos, root_quat, joint_dof
+
     def _split_qpos_36(self, qpos_36: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """G1 compatibility wrapper for downstream callers using the old name."""
+
         if qpos_36.shape[-1] != 36:
             raise ValueError(f"Expected qpos_36 last dim 36, got {qpos_36.shape}")
-        root_pos = qpos_36[..., :3]
-        root_quat = F.normalize(qpos_36[..., 3:7], dim=-1)
-        root_quat = standardize_quaternion(root_quat)
-        joint_dof = qpos_36[..., 7:]
-        return root_pos, root_quat, joint_dof
+        return self._split_qpos(qpos_36)
 
     def canonicalize(
         self,
-        qpos_36: torch.Tensor,
+        qpos: torch.Tensor,
         body_pos_w: torch.Tensor,
         body_quat_w: torch.Tensor | None,
         anchor_root_pos: torch.Tensor,
@@ -189,7 +199,7 @@ class G1MotionFeatureCodec:
         valid_mask: torch.Tensor | None = None,
     ) -> MotionComponents:
         anchor_root_pos, _, heading_quat_inv = self._canonical_anchor(anchor_root_pos, anchor_root_quat)
-        root_pos_w, root_rot_w, joint_dof = self._split_qpos_36(qpos_36)
+        root_pos_w, root_rot_w, joint_dof = self._split_qpos(qpos)
 
         heading_quat_seq = heading_quat_inv.expand(*root_pos_w.shape[:-1], 4)
         root_pos_local = quaternion_apply(heading_quat_seq, root_pos_w - anchor_root_pos)
@@ -225,7 +235,7 @@ class G1MotionFeatureCodec:
         body_quat_local = standardize_quaternion(body_quat_local)
         return quaternion_to_matrix(body_quat_local)
 
-    def decode_to_world_qpos36(
+    def decode_to_world_qpos(
         self,
         components: MotionComponents,
         anchor_root_pos: torch.Tensor,
@@ -241,24 +251,42 @@ class G1MotionFeatureCodec:
         root_rot_world_quat = standardize_quaternion(root_rot_world_quat)
         return torch.cat([root_pos_world, root_rot_world_quat, components.joint_dof], dim=-1)
 
+    def decode_to_world_qpos36(
+        self,
+        components: MotionComponents,
+        anchor_root_pos: torch.Tensor,
+        anchor_root_quat: torch.Tensor,
+    ) -> torch.Tensor:
+        """G1 compatibility wrapper for the historical qpos36 API."""
+
+        if int(getattr(self.kinematics, "qpos_dim", 36)) != 36:
+            raise ValueError("decode_to_world_qpos36 is only valid for a 36-dimensional robot")
+        return self.decode_to_world_qpos(components, anchor_root_pos, anchor_root_quat)
+
     def prev_state_features_from_history(
         self,
-        prev_qpos_36: torch.Tensor,
+        prev_qpos: torch.Tensor,
         prev_body_pos_w: torch.Tensor,
         prev_body_quat_w: torch.Tensor | None,
         fps: torch.Tensor | float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        anchor_root_pos = prev_qpos_36[..., self.canonical_frame_idx : self.canonical_frame_idx + 1, :3]
-        anchor_root_quat = prev_qpos_36[..., self.canonical_frame_idx : self.canonical_frame_idx + 1, 3:7]
+        anchor_root_pos = prev_qpos[..., self.canonical_frame_idx : self.canonical_frame_idx + 1, :3]
+        anchor_root_quat = prev_qpos[..., self.canonical_frame_idx : self.canonical_frame_idx + 1, 3:7]
         anchor_root_quat = F.normalize(anchor_root_quat, dim=-1)
         anchor_root_quat = standardize_quaternion(anchor_root_quat)
         comps = self.canonicalize(
-            prev_qpos_36,
+            prev_qpos,
             prev_body_pos_w,
             prev_body_quat_w,
             anchor_root_pos=anchor_root_pos,
             anchor_root_quat=anchor_root_quat,
             fps=fps,
-            valid_mask=torch.ones(prev_qpos_36.shape[:-1], dtype=torch.bool, device=prev_qpos_36.device),
+            valid_mask=torch.ones(prev_qpos.shape[:-1], dtype=torch.bool, device=prev_qpos.device),
         )
         return self.assemble_features(comps), anchor_root_pos, anchor_root_quat
+
+
+class G1MotionFeatureCodec(MotionFeatureCodec):
+    """Backwards-compatible G1 codec name."""
+
+    pass

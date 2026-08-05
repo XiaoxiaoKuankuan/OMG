@@ -2,4 +2,6 @@ repo_root: .
 output_root: outputs
 data_root: ${oc.env:OMG_DATA_ROOT,${paths.repo_root}/data/OMG-Data}
 materialized_root: ${oc.env:OMG_MATERIALIZED_ROOT,${paths.data_root}/materialized}
+bumi_data_root: ${oc.env:OMG_BUMI_DATA_ROOT,${paths.repo_root}/data/OMG-BUMI-Data}
+bumi_materialized_root: ${oc.env:OMG_BUMI_MATERIALIZED_ROOT,${paths.bumi_data_root}/materialized}
 models_root: ${oc.env:OMG_MODELS_ROOT,${paths.repo_root}/models}

@@ -474,8 +474,13 @@ def _mux_wav_audio(
 def _val_dataset(cfg, *, num_frames: int):
     datamodule = instantiate(cfg.data, _recursive_=False)
     dataset_cfg = next(iter(cfg.data.dataset_opts.val.values())).copy()
-    if dataset_cfg.get("_target_") != "omg.data.lerobot_dataset.LeRobotG1MotionDataset":
-        raise TypeError("Generation sample selection requires the canonical LeRobot data config")
+    target = str(dataset_cfg.get("_target_", ""))
+    if target not in {
+        "omg.data.lerobot_dataset.LeRobotMotionDataset",
+        "omg.data.lerobot_dataset.LeRobotG1MotionDataset",
+        "omg.data.lerobot_dataset.LeRobotBumiMotionDataset",
+    }:
+        raise TypeError("Generation sample selection requires a LeRobot motion data config")
     fps = float(dataset_cfg.get("fps", 30.0))
     dataset_cfg["sequence_duration"] = int(num_frames) / fps
     return datamodule._instantiate_dataset(dataset_cfg)
@@ -555,7 +560,7 @@ def _render_overlay_lines(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate G1 motion from a trained generation checkpoint.")
+    parser = argparse.ArgumentParser(description="Generate robot motion from a trained OMG checkpoint.")
     parser.add_argument("--ckpt_path", required=True)
     parser.add_argument("--exp", required=True)
     parser.add_argument("--output_root", default="outputs_generate")
@@ -637,7 +642,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--camera_view", choices=["iso", "side", "both"], default="iso")
     parser.add_argument("--follow_mode", choices=["none", "xy", "xyz"], default="xy")
     parser.add_argument("--scene_preset", choices=["minimal", "studio"], default="studio")
-    parser.add_argument("--title", default="G1 Motion")
+    parser.add_argument("--title", default=None)
     parser.add_argument("overrides", nargs="*", help="Additional Hydra overrides, e.g. data=... model.text_encoder.model_name=...")
     return parser.parse_args()
 
@@ -758,15 +763,20 @@ def main() -> None:
     output_tag = _default_output_tag(args)
     output_dir = Path(args.output_root) / args.exp / output_tag
     output_dir.mkdir(parents=True, exist_ok=True)
-    qpos = sample["qpos_36"].detach().cpu()[:, :requested_num_frames]
+    robot_name = str(model.representation.robot_name)
+    state_dim = int(model.representation.state_dim)
+    joint_names = list(model.representation.joint_names)
+    qpos = sample["qpos"].detach().cpu()[:, :requested_num_frames]
+    if qpos.shape[-1] != state_dim:
+        raise ValueError(f"Generated qpos has shape {tuple(qpos.shape)}, expected state_dim={state_dim}")
     motion_features = sample["motion_features"].detach().cpu()[:, :requested_num_frames]
     gt_qpos = None
     gt_available_frames = None
     if args.save_gt_motion or args.render_comparison_video:
         valid = batch.get("mask", {}).get("valid")
-        history_qpos = batch.get("qpos_36")
+        history_qpos = batch.get("qpos")
         if not torch.is_tensor(valid) or not torch.is_tensor(history_qpos):
-            raise ValueError("Selected LeRobot validation sample does not expose qpos_36 and mask.valid")
+            raise ValueError("Selected LeRobot validation sample does not expose qpos and mask.valid")
         gt_available_frames = int(valid[0].sum().item())
         if requested_num_frames > gt_available_frames:
             raise ValueError(
@@ -789,15 +799,29 @@ def main() -> None:
         human_motion_path=human_motion_path,
         args=args,
     )
-    torch.save({"qpos_36": qpos, "motion_features": motion_features}, output_dir / "sample.pt")
-    np.save(output_dir / "qpos_36.npy", qpos[0].numpy().astype(np.float32, copy=False))
+    sample_payload = {
+        "robot_name": robot_name,
+        "qpos": qpos,
+        "joint_names": joint_names,
+        "fps": float(args.fps),
+        "quaternion_convention": "wxyz",
+        "motion_features": motion_features,
+    }
+    if robot_name == "g1":
+        sample_payload["qpos_36"] = qpos
+    torch.save(sample_payload, output_dir / "sample.pt")
+    np.save(output_dir / "qpos.npy", qpos[0].numpy().astype(np.float32, copy=False))
+    if robot_name == "g1":
+        np.save(output_dir / "qpos_36.npy", qpos[0].numpy().astype(np.float32, copy=False))
     if gt_qpos is not None:
         gt_meta = history_meta
-        np.save(output_dir / "gt_qpos_36.npy", gt_qpos.astype(np.float32, copy=False))
-        np.savez_compressed(
-            output_dir / "gt_reference_motion.npz",
-            qpos_36=gt_qpos.astype(np.float32, copy=False),
+        np.save(output_dir / "gt_qpos.npy", gt_qpos.astype(np.float32, copy=False))
+        gt_payload = dict(
+            qpos=gt_qpos.astype(np.float32, copy=False),
             fps=np.asarray([float(args.fps)], dtype=np.float32),
+            robot_name=np.asarray([robot_name], dtype=np.str_),
+            joint_names=np.asarray(joint_names, dtype=np.str_),
+            quaternion_convention=np.asarray(["wxyz"], dtype=np.str_),
             source_file=np.asarray([str(gt_meta.get("source_file", ""))], dtype=np.str_),
             history_val_index=np.asarray([history_val_index], dtype=np.int32),
             window_start=np.asarray([int(gt_meta.get("window_start", 0))], dtype=np.int32),
@@ -805,10 +829,16 @@ def main() -> None:
             music_path=np.asarray([] if music_path is None else [music_path], dtype=np.str_),
             music_wav_path=np.asarray([] if music_wav_path is None else [str(music_wav_path)], dtype=np.str_),
         )
-    np.savez_compressed(
-        output_dir / "reference_motion.npz",
-        qpos_36=qpos[0].numpy().astype(np.float32, copy=False),
+        if robot_name == "g1":
+            gt_payload["qpos_36"] = gt_payload["qpos"]
+            np.save(output_dir / "gt_qpos_36.npy", gt_qpos.astype(np.float32, copy=False))
+        np.savez_compressed(output_dir / "gt_reference_motion.npz", **gt_payload)
+    reference_payload = dict(
+        qpos=qpos[0].numpy().astype(np.float32, copy=False),
         fps=np.asarray([float(args.fps)], dtype=np.float32),
+        robot_name=np.asarray([robot_name], dtype=np.str_),
+        joint_names=np.asarray(joint_names, dtype=np.str_),
+        quaternion_convention=np.asarray(["wxyz"], dtype=np.str_),
         text=np.asarray([text], dtype=np.str_),
         exp=np.asarray([str(args.exp)], dtype=np.str_),
         ckpt_path=np.asarray([str(Path(args.ckpt_path).resolve())], dtype=np.str_),
@@ -824,6 +854,9 @@ def main() -> None:
             dtype=np.str_,
         ),
     )
+    if robot_name == "g1":
+        reference_payload["qpos_36"] = reference_payload["qpos"]
+    np.savez_compressed(output_dir / "reference_motion.npz", **reference_payload)
     if music_features is not None:
         np.save(output_dir / "music_features.npy", music_features[:render_num_frames].numpy().astype(np.float32, copy=False))
         np.save(output_dir / "has_audio.npy", has_audio[:render_num_frames].numpy().astype(np.bool_, copy=False))
@@ -848,17 +881,20 @@ def main() -> None:
         )
         video_path = render_qpos_video(
             qpos[0],
-            output_dir / _tagged_name("qpos_36_mujoco", output_tag, ".mp4"),
+            output_dir / _tagged_name("qpos_mujoco", output_tag, ".mp4"),
             fps=args.fps,
             width=args.width,
             height=args.height,
             camera_view=args.camera_view,
             follow_mode=args.follow_mode,
             scene_preset=args.scene_preset,
-            title=args.title,
+            title=args.title or f"{robot_name.upper()} Motion",
             overlay_lines=render_overlay_lines,
             music_end_frame=condition_end_frame,
             ended_message=ended_message,
+            robot_name=robot_name,
+            kinematics_path=model.representation.kinematics.kinematics_path,
+            mjcf_path="assets/robots/bumi/bumi3.xml" if robot_name == "bumi" else None,
         )
 
         if music_wav_path is not None:
@@ -876,7 +912,7 @@ def main() -> None:
 
         gt_video_path = render_qpos_video(
             torch.as_tensor(gt_qpos, dtype=torch.float32),
-            output_dir / _tagged_name("gt_qpos_36_mujoco", output_tag, ".mp4"),
+            output_dir / _tagged_name("gt_qpos_mujoco", output_tag, ".mp4"),
             fps=args.fps,
             width=args.width,
             height=args.height,
@@ -885,6 +921,9 @@ def main() -> None:
             scene_preset=args.scene_preset,
             title="Ground Truth",
             overlay_lines=render_overlay_lines,
+            robot_name=robot_name,
+            kinematics_path=model.representation.kinematics.kinematics_path,
+            mjcf_path="assets/robots/bumi/bumi3.xml" if robot_name == "bumi" else None,
         )
     if args.render_comparison_video and gt_qpos is not None:
         from omg.render.mujoco import render_qpos_comparison_video
@@ -910,6 +949,9 @@ def main() -> None:
             music_end_frame=music_end_frame,
             left_ghost_qpos_36=gt_qpos if args.overlay_gt_on_generated else None,
             left_ghost_alpha=args.overlay_gt_alpha,
+            robot_name=robot_name,
+            kinematics_path=model.representation.kinematics.kinematics_path,
+            mjcf_path="assets/robots/bumi/bumi3.xml" if robot_name == "bumi" else None,
         )
         if music_wav_path is not None:
             audio_start = float(music_start_frame) / float(args.fps) if music_start_frame > 0 else None
@@ -953,6 +995,11 @@ def main() -> None:
         )
     metadata = {
         "ckpt_path": str(Path(args.ckpt_path).resolve()),
+        "robot_name": robot_name,
+        "state_dim": state_dim,
+        "joint_names": joint_names,
+        "fps": float(args.fps),
+        "quaternion_convention": "wxyz",
         "exp": args.exp,
         "output_tag": output_tag,
         "num_frames": int(args.num_frames),
@@ -988,7 +1035,11 @@ def main() -> None:
         "has_audio_path": None if has_audio is None else str((output_dir / "has_audio.npy").resolve()),
         "human_motion_features_path": None if human_motion is None else str((output_dir / "human_motion.npy").resolve()),
         "has_human_motion_path": None if has_human_motion is None else str((output_dir / "has_human_motion.npy").resolve()),
-        "gt_qpos_36_path": None if gt_qpos is None else str((output_dir / "gt_qpos_36.npy").resolve()),
+        "qpos_path": str((output_dir / "qpos.npy").resolve()),
+        "gt_qpos_path": None if gt_qpos is None else str((output_dir / "gt_qpos.npy").resolve()),
+        "gt_qpos_36_path": None
+        if gt_qpos is None or robot_name != "g1"
+        else str((output_dir / "gt_qpos_36.npy").resolve()),
         "gt_reference_motion_path": None if gt_qpos is None else str((output_dir / "gt_reference_motion.npz").resolve()),
         "video_path": None if video_path is None else str(video_path.resolve()),
         "video_with_audio_path": None if video_with_audio_path is None else str(video_with_audio_path.resolve()),

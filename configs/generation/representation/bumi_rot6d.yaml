@@ -1,0 +1,9 @@
+_target_: omg.motion.representation.BumiMotionRepresentation
+stats_path: ${oc.env:OMG_BUMI_STATS_PATH,assets/stats/bumi_93d_stats.json}
+kinematics_path: assets/robots/bumi/bumi_kinematics.json
+num_prev_states: 10
+canonical_frame_idx: 9
+feat_dim: 93
+sequence_length: 60
+rotation_representation: rot6d
+rot6d_gradient_mode: vanilla

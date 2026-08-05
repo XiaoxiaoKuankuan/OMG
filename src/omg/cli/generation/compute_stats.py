@@ -25,7 +25,11 @@ def _resolve_dataset_cfg(cfg: dict[str, Any], representation: dict[str, Any], pa
     OmegaConf.resolve(root)
     resolved = OmegaConf.to_container(root.dataset, resolve=True)
     target = str(resolved.get("_target_", ""))
-    if target == "omg.data.lerobot_dataset.LeRobotG1MotionDataset":
+    if target in {
+        "omg.data.lerobot_dataset.LeRobotMotionDataset",
+        "omg.data.lerobot_dataset.LeRobotG1MotionDataset",
+        "omg.data.lerobot_dataset.LeRobotBumiMotionDataset",
+    }:
         resolved.setdefault("rotation_representation", representation.get("rotation_representation", "quat"))
     return resolved
 
@@ -59,10 +63,43 @@ def compute_stats(args: argparse.Namespace) -> dict[str, Any]:
     m2 = None
     qpos_sum = None
     qpos_count = 0
+    state_dim = None
+    robot_name = None
+    joint_names: tuple[str, ...] | None = None
+    feature_body_count = None
 
     for name, raw_cfg in datasets.items():
         cfg = _resolve_dataset_cfg(raw_cfg, repr_cfg, paths_cfg)
         dataset = instantiate(OmegaConf.create(cfg))
+        dataset_state_dim = int(getattr(dataset, "state_dim", repr_cfg.get("state_dim", 36)))
+        dataset_robot_name = str(getattr(dataset, "robot_name", repr_cfg.get("robot_name", "g1")))
+        kinematics = getattr(dataset, "kinematics", None)
+        codec = getattr(dataset, "codec", None)
+        dataset_joint_names = tuple(getattr(kinematics, "joint_order", ()))
+        if not dataset_joint_names:
+            dataset_joint_names = tuple(
+                f"joint_{index}" for index in range(dataset_state_dim - 7)
+            )
+        dataset_feature_body_count = int(getattr(codec, "num_body_links", 0))
+        if dataset_feature_body_count <= 0:
+            rotation_name = str(repr_cfg.get("rotation_representation", "quat")).lower()
+            root_rotation_dim = 6 if rotation_name in {"rot6d", "rotation_6d", "6d"} else 4
+            remaining = int(repr_cfg["feat_dim"]) - 3 - root_rotation_dim - (dataset_state_dim - 7)
+            if remaining < 0 or remaining % 3:
+                raise ValueError("Cannot infer feature body count from representation config")
+            dataset_feature_body_count = remaining // 3
+        if state_dim is None:
+            state_dim = dataset_state_dim
+            robot_name = dataset_robot_name
+            joint_names = dataset_joint_names
+            feature_body_count = dataset_feature_body_count
+        elif (
+            state_dim != dataset_state_dim
+            or robot_name != dataset_robot_name
+            or joint_names != dataset_joint_names
+            or feature_body_count != dataset_feature_body_count
+        ):
+            raise ValueError("All datasets used for one stats file must share one robot representation")
         if not hasattr(dataset, "iter_stats_batches"):
             raise TypeError(
                 f"Dataset {type(dataset).__name__} must implement iter_stats_batches() for exact scalable stats"
@@ -79,12 +116,12 @@ def compute_stats(args: argparse.Namespace) -> dict[str, Any]:
         for batch in iterator:
             valid = batch["valid_mask"].bool()
             features = batch["motion_features"][valid]
-            qpos = batch["qpos_36"][valid]
+            qpos = batch["qpos"][valid]
             if features.numel() == 0:
                 continue
             count, mean, m2 = _update_moments(count, mean, m2, features)
             if qpos_sum is None:
-                qpos_sum = torch.zeros(36, dtype=torch.float64, device=qpos.device)
+                qpos_sum = torch.zeros(int(state_dim), dtype=torch.float64, device=qpos.device)
             qpos_sum += qpos.double().sum(dim=0)
             qpos_count += int(qpos.shape[0])
 
@@ -97,7 +134,9 @@ def compute_stats(args: argparse.Namespace) -> dict[str, Any]:
         elif int(mean.numel()) != feature_dim:
             raise ValueError(f"Expected {feature_dim} feature dimensions, got {mean.numel()}")
         if qpos_sum is None:
-            qpos_sum = torch.zeros(36, dtype=torch.float64, device=moments_device)
+            if state_dim is None:
+                raise RuntimeError("Cannot infer state_dim without an instantiated dataset")
+            qpos_sum = torch.zeros(int(state_dim), dtype=torch.float64, device=moments_device)
         aggregate = torch.cat(
             [
                 torch.tensor([count, qpos_count], dtype=torch.float64, device=mean.device),
@@ -132,8 +171,26 @@ def compute_stats(args: argparse.Namespace) -> dict[str, Any]:
         "rotation_6d": 6,
         "6d": 6,
     }[rot_key]
+    if state_dim is None or robot_name is None or joint_names is None or feature_body_count is None:
+        raise RuntimeError("No robot metadata was found while computing stats")
+    num_joints = int(state_dim) - 7
+    feature_dim = int(mean.numel())
+    expected_feature_dim = 3 + root_rot_dim + num_joints + 3 * int(feature_body_count)
+    if feature_dim != expected_feature_dim:
+        raise ValueError(
+            f"Feature layout mismatch: stats={feature_dim}, expected={expected_feature_dim} "
+            f"for state_dim={state_dim}, feature_bodies={feature_body_count}"
+        )
     return {
-        "feature": f"root_pos_local+root_rot_local_{rotation_representation}_{root_rot_dim}+joint_dof_29+body_link_pos_local_29x3",
+        "feature": (
+            f"root_pos_local+root_rot_local_{rotation_representation}_{root_rot_dim}"
+            f"+joint_dof_{num_joints}+body_link_pos_local_{feature_body_count}x3"
+        ),
+        "robot_name": robot_name,
+        "state_dim": int(state_dim),
+        "feature_dim": feature_dim,
+        "joint_names": list(joint_names),
+        "quaternion_convention": "wxyz",
         "rotation_representation": rotation_representation,
         "split": args.split,
         "count": count,

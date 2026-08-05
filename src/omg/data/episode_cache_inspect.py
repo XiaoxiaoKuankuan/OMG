@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from omg.data.episode_cache import EpisodeCachedG1MotionDataset
+from omg.data.episode_cache import EpisodeCachedG1MotionDataset, EpisodeCachedMotionDataset
 
 
 def inspect_episode_cache(root: str | Path, split: str) -> dict[str, Any]:
@@ -17,8 +17,18 @@ def inspect_episode_cache(root: str | Path, split: str) -> dict[str, Any]:
         summary = json.loads((split_root / "summary.json").read_text(encoding="utf-8"))
     except Exception as exc:
         return {"root": str(root.resolve()), "split": split, "valid": False, "errors": [str(exc)]}
-    if summary.get("format") != EpisodeCachedG1MotionDataset.FORMAT:
+    cache_format = summary.get("format")
+    supported_formats = {EpisodeCachedG1MotionDataset.FORMAT, EpisodeCachedMotionDataset.FORMAT}
+    if cache_format not in supported_formats:
         errors.append(f"unexpected format: {summary.get('format')!r}")
+    is_v3 = cache_format == EpisodeCachedMotionDataset.FORMAT
+    state_dim = int(summary.get("state_dim", 36))
+    feature_body_count = int(summary.get("feature_body_count", 21 if summary.get("robot_name") == "bumi" else 29))
+    qpos_key = "qpos" if is_v3 else "qpos_36"
+    if is_v3:
+        for key in ("robot_name", "state_dim", "feature_dim", "kinematics_sha256", "representation_name"):
+            if not summary.get(key):
+                errors.append(f"v3 summary has no {key}")
     for key in ("source_repo_id", "source_revision"):
         if not str(summary.get(key, "")).strip():
             errors.append(f"summary has no pinned {key}")
@@ -66,17 +76,17 @@ def inspect_episode_cache(root: str | Path, split: str) -> dict[str, Any]:
             manifest = json.loads((shard_root / "manifest.json").read_text(encoding="utf-8"))
             arrays = {
                 key: np.load(shard_root / f"{key}.npy", mmap_mode="r")
-                for key in ("qpos_36", "body_pos_w", "body_quat_w")
+                for key in (qpos_key, "body_pos_w", "body_quat_w")
             }
         except Exception as exc:
             errors.append(f"shard {shard_id}: {exc}")
             continue
-        rows = int(arrays["qpos_36"].shape[0])
-        if arrays["qpos_36"].shape[1:] != (36,):
-            errors.append(f"shard {shard_id}: qpos_36 shape {arrays['qpos_36'].shape}")
-        if arrays["body_pos_w"].shape != (rows, 30, 3):
+        rows = int(arrays[qpos_key].shape[0])
+        if arrays[qpos_key].shape[1:] != (state_dim,):
+            errors.append(f"shard {shard_id}: {qpos_key} shape {arrays[qpos_key].shape}")
+        if arrays["body_pos_w"].shape != (rows, feature_body_count + 1, 3):
             errors.append(f"shard {shard_id}: body_pos_w shape {arrays['body_pos_w'].shape}")
-        if arrays["body_quat_w"].shape != (rows, 30, 4):
+        if arrays["body_quat_w"].shape != (rows, feature_body_count + 1, 4):
             errors.append(f"shard {shard_id}: body_quat_w shape {arrays['body_quat_w'].shape}")
         if int(manifest.get("frames", -1)) != rows:
             errors.append(f"shard {shard_id}: manifest frames do not match arrays")

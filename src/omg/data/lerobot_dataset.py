@@ -14,7 +14,8 @@ from torch.utils.data import Dataset
 
 from omg.core.tensor import get_valid_mask, repeat_to_max_len
 from omg.data.windowing import ExhaustiveWindowSampleView, is_exhaustive_train_window_policy
-from omg.motion.feature_codec import G1MotionFeatureCodec
+from omg.motion.feature_codec import G1MotionFeatureCodec, MotionFeatureCodec
+from omg.robots.bumi.kinematics import BumiKinematics
 from omg.robots.g1.kinematics import G1Kinematics
 from omg.utils.rotation_conversions import standardize_quaternion
 
@@ -114,8 +115,8 @@ def _select_parquet_files_for_index_range(
     return selected, selected_offset
 
 
-class LeRobotG1MotionDataset(Dataset):
-    """Adapt an official LeRobotDataset v3 dataset to OMG training samples."""
+class LeRobotMotionDataset(Dataset):
+    """Adapt a robot-parameterized LeRobotDataset v3 to OMG training samples."""
 
     def __init__(
         self,
@@ -141,7 +142,20 @@ class LeRobotG1MotionDataset(Dataset):
         exhaustive_train_slicing: bool = True,
         eval_window_policy: str = "uniform",
         eval_num_windows: int = 3,
+        robot_name: str = "g1",
+        state_dim: int = 36,
+        manifest_filename: str = "omg_manifest.json",
     ) -> None:
+        self.robot_name = str(robot_name).strip().lower()
+        self.state_dim = int(state_dim)
+        self.manifest_filename = str(manifest_filename)
+        if self.robot_name not in {"g1", "bumi"}:
+            raise ValueError(f"Unsupported robot_name={robot_name!r}; expected g1 or bumi")
+        expected_state_dim = {"g1": 36, "bumi": 28}[self.robot_name]
+        if self.state_dim != expected_state_dim:
+            raise ValueError(
+                f"robot_name={self.robot_name} requires state_dim={expected_state_dim}, got {self.state_dim}"
+            )
         self.repo_id = str(repo_id)
         self.revision = str(revision)
         self.manifest_sha256 = str(manifest_sha256).lower()
@@ -154,7 +168,7 @@ class LeRobotG1MotionDataset(Dataset):
                 "LeRobot manifest_sha256 must be a full 64-character SHA-256 digest, "
                 f"got {self.manifest_sha256!r}"
             )
-        if self.repo_id == LEROBOT_REPO_ID and (
+        if self.robot_name == "g1" and self.repo_id == LEROBOT_REPO_ID and (
             self.revision != LEROBOT_REVISION or self.manifest_sha256 != LEROBOT_MANIFEST_SHA256
         ):
             raise ValueError(
@@ -186,7 +200,7 @@ class LeRobotG1MotionDataset(Dataset):
         if self.train_window_stride <= 0:
             raise ValueError(f"train_window_stride must be positive, got {self.train_window_stride}")
 
-        manifest_path = self.dataset_root / "meta" / "omg_manifest.json"
+        manifest_path = self.dataset_root / "meta" / self.manifest_filename
         if not manifest_path.is_file():
             raise FileNotFoundError(f"Missing OMG release manifest: {manifest_path}")
         actual_manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
@@ -197,11 +211,14 @@ class LeRobotG1MotionDataset(Dataset):
                 f"expected_sha256={self.manifest_sha256} revision={self.revision}"
             )
         release_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if release_manifest.get("repo_id") != self.repo_id:
+        manifest_repo_id = release_manifest.get("repo_id")
+        if self.robot_name == "g1" and manifest_repo_id != self.repo_id:
             raise ValueError(
                 "LeRobot release manifest repository mismatch: "
                 f"manifest={release_manifest.get('repo_id')!r} expected={self.repo_id!r}"
             )
+        if self.robot_name == "bumi" and release_manifest.get("robot_name") != "bumi":
+            raise ValueError("BUMI release manifest must declare robot_name='bumi'")
 
         info_path = self.dataset_root / "meta" / "info.json"
         if not info_path.is_file():
@@ -215,8 +232,10 @@ class LeRobotG1MotionDataset(Dataset):
         if missing:
             raise ValueError(f"LeRobot dataset is missing required OMG features: {sorted(missing)}")
         state_shape = tuple(info["features"]["observation.state"]["shape"])
-        if state_shape != (36,):
-            raise ValueError(f"Expected observation.state shape (36,), got {state_shape}")
+        if state_shape != (self.state_dim,):
+            raise ValueError(
+                f"Expected observation.state shape ({self.state_dim},), got {state_shape}"
+            )
         if self.use_audio and "omg.audio.feature" not in info["features"]:
             raise ValueError("use_audio=true but LeRobot dataset has no `omg.audio.feature`")
         if self.use_human_motion and "omg.humanref.motion" not in info["features"]:
@@ -240,8 +259,13 @@ class LeRobotG1MotionDataset(Dataset):
         self.episode_data_files = tuple(selected_episode_files)
         self.episode_dataset = HFDataset.from_parquet([str(path) for path in selected_episode_files])
 
-        self.kinematics = G1Kinematics(kinematics_path=kinematics_path)
-        self.codec = G1MotionFeatureCodec(
+        if self.robot_name == "g1":
+            self.kinematics = G1Kinematics(kinematics_path=kinematics_path)
+            codec_class = G1MotionFeatureCodec
+        else:
+            self.kinematics = BumiKinematics(kinematics_path=kinematics_path)
+            codec_class = MotionFeatureCodec
+        self.codec = codec_class(
             self.kinematics,
             num_prev_states=self.num_prev_states,
             canonical_frame_idx=canonical_frame_idx,
@@ -273,7 +297,8 @@ class LeRobotG1MotionDataset(Dataset):
         self._cached_episode_kinematics: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self._cached_episode_kinematics_device: torch.device | None = None
         print(
-            f"[INFO] LeRobotG1MotionDataset repo_id={self.repo_id} root={self.dataset_root} "
+            f"[INFO] LeRobotMotionDataset robot={self.robot_name} repo_id={self.repo_id} "
+            f"root={self.dataset_root} "
             f"split={self.split} episodes={len(self.episodes)} samples={len(self.samples)} "
             f"frame_files={len(self.frame_data_files)}/{len(data_files)} "
             f"episode_files={len(self.episode_data_files)}/{len(episode_files)} "
@@ -372,8 +397,10 @@ class LeRobotG1MotionDataset(Dataset):
         raw = self.frame_dataset.select_columns(columns)[start:end]
         data = {name: np.asarray(raw[name]) for name in columns}
         qpos = np.asarray(data["observation.state"], dtype=np.float32)
-        if qpos.ndim != 2 or qpos.shape[1] != 36:
-            raise ValueError(f"Expected episode observation.state shape (T, 36), got {tuple(qpos.shape)}")
+        if qpos.ndim != 2 or qpos.shape[1] != self.state_dim:
+            raise ValueError(
+                f"Expected episode observation.state shape (T, {self.state_dim}), got {tuple(qpos.shape)}"
+            )
         self._cached_episode_index = episode_index
         self._cached_episode_data = data
         self._cached_episode_kinematics = None
@@ -558,11 +585,14 @@ class LeRobotG1MotionDataset(Dataset):
                 fps=fps,
                 valid_mask=values["valid_mask"],
             )
-            return {
+            encoded = {
                 "motion_features": self.codec.assemble_features(components),
-                "qpos_36": values["qpos_36"],
+                "qpos": values["qpos_36"],
                 "valid_mask": values["valid_mask"],
             }
+            if self.robot_name == "g1":
+                encoded["qpos_36"] = values["qpos_36"]
+            return encoded
 
         episode_cursor = 0
         while episode_cursor < len(selected_episodes) and produced + pending_count < sample_limit:
@@ -692,10 +722,12 @@ class LeRobotG1MotionDataset(Dataset):
             fk = self.kinematics.forward_kinematics(qpos_36)
             group = {
                 "episodes": episode_group,
-                "qpos_36": qpos_36,
+                "qpos": qpos_36,
                 "body_pos_w": fk["body_pos_w"],
                 "body_quat_w": standardize_quaternion(F.normalize(fk["body_quat_w"], dim=-1)),
             }
+            if self.robot_name == "g1":
+                group["qpos_36"] = qpos_36
             if self.use_audio:
                 group["audio_features"] = torch.as_tensor(
                     np.asarray(raw["omg.audio.feature"], dtype=np.float32),
@@ -783,10 +815,11 @@ class LeRobotG1MotionDataset(Dataset):
             )
         caption = str(sample_info.get("segment_caption", "")) if self.use_text else ""
         valid_window_mask = get_valid_mask(self.window_size, valid_len)
-        return {
+        result = {
             "length": torch.tensor(valid_len, dtype=torch.long),
             "fps": torch.tensor(self.default_fps, dtype=torch.float32),
-            "qpos_36": qpos_36,
+            "qpos": qpos_36,
+            "prev_qpos": prev_qpos_36,
             "body_pos_w": body_pos_w,
             "body_quat_w": body_quat_w,
             "audio_features": audio_features,
@@ -825,5 +858,32 @@ class LeRobotG1MotionDataset(Dataset):
                 "eval_window_index": sample_info.get("eval_window_index", 0),
                 "eval_num_windows": sample_info.get("eval_num_windows", 1),
                 "lerobot_episode_index": sample_info.get("episode_index"),
+                "robot_name": self.robot_name,
             },
         }
+        if self.robot_name == "g1":
+            result["qpos_36"] = qpos_36
+            result["prev_qpos_36"] = prev_qpos_36
+        return result
+
+
+class LeRobotG1MotionDataset(LeRobotMotionDataset):
+    """Compatibility wrapper for the pinned official G1 release."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("robot_name", "g1")
+        kwargs.setdefault("state_dim", 36)
+        kwargs.setdefault("manifest_filename", "omg_manifest.json")
+        kwargs.setdefault("kinematics_path", "assets/robots/g1/g1_kinematics.json")
+        super().__init__(*args, **kwargs)
+
+
+class LeRobotBumiMotionDataset(LeRobotMotionDataset):
+    """BUMI-native LeRobotDataset v3 reader with custom manifest identity validation."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("robot_name", "bumi")
+        kwargs.setdefault("state_dim", 28)
+        kwargs.setdefault("manifest_filename", "omg_bumi_manifest.json")
+        kwargs.setdefault("kinematics_path", "assets/robots/bumi/bumi_kinematics.json")
+        super().__init__(*args, **kwargs)

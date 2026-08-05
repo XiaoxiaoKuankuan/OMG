@@ -17,6 +17,8 @@ import mujoco
 import numpy as np
 import torch
 
+from omg.robots.base import RobotKinematics
+from omg.robots.bumi.kinematics import BumiKinematics
 from omg.robots.g1.kinematics import G1Kinematics
 from omg.utils.rotation_conversions import euler_angles_to_matrix, matrix_to_quaternion
 
@@ -523,18 +525,29 @@ def _set_data_qpos_with_prefix(
         data.qpos[joint_qposadr[prefixed_joint]] = qpos_frame[7 + qpos_index]
 
 
-def _as_qpos_36_np(qpos_36: torch.Tensor | np.ndarray, *, name: str = "qpos_36") -> np.ndarray:
-    if isinstance(qpos_36, torch.Tensor):
-        qpos_np = qpos_36.detach().float().cpu().numpy()
+def _as_qpos_np(
+    qpos: torch.Tensor | np.ndarray,
+    *,
+    state_dim: int,
+    name: str = "qpos",
+) -> np.ndarray:
+    if isinstance(qpos, torch.Tensor):
+        qpos_np = qpos.detach().float().cpu().numpy()
     else:
-        qpos_np = np.asarray(qpos_36, dtype=np.float32)
+        qpos_np = np.asarray(qpos, dtype=np.float32)
     if qpos_np.ndim == 3:
         if qpos_np.shape[0] != 1:
             raise ValueError(f"Expected batch dimension 1 for {name}, got {qpos_np.shape}")
         qpos_np = qpos_np[0]
-    if qpos_np.ndim != 2 or qpos_np.shape[-1] != 36:
-        raise ValueError(f"Expected {name} shape (T,36), got {qpos_np.shape}")
+    if qpos_np.ndim != 2 or qpos_np.shape[-1] != int(state_dim):
+        raise ValueError(f"Expected {name} shape (T,{int(state_dim)}), got {qpos_np.shape}")
     return np.asarray(qpos_np, dtype=np.float32)
+
+
+def _as_qpos_36_np(qpos_36: torch.Tensor | np.ndarray, *, name: str = "qpos_36") -> np.ndarray:
+    """Backward-compatible G1 shape validator."""
+
+    return _as_qpos_np(qpos_36, state_dim=36, name=name)
 
 
 def _joint_qpos_addresses(model: mujoco.MjModel, joint_names: Iterable[str]) -> dict[str, int]:
@@ -564,7 +577,7 @@ def _camera_azimuths(camera_view: str, iso_azimuth: float, side_azimuth: float) 
 def render_qpos_frames(
     qpos_36: np.ndarray,
     body_pos_w: np.ndarray,
-    kinematics: G1Kinematics,
+    kinematics: RobotKinematics,
     model: mujoco.MjModel,
     data: mujoco.MjData,
     width: int = 1280,
@@ -957,17 +970,23 @@ def render_qpos_video(
     ended_message: str = "Music ended; using null audio",
     per_frame_info_lines: list[list[str]] | None = None,
     camera_distance_scale: float = 1.0,
+    robot_name: str = "g1",
+    mjcf_path: str | Path | None = None,
 ) -> Path:
-    if isinstance(qpos_36, torch.Tensor):
-        qpos_np = qpos_36.detach().float().cpu().numpy()
+    robot_name = str(robot_name).lower()
+    if robot_name == "g1":
+        state_dim = 36
+        kinematics: RobotKinematics = G1Kinematics(kinematics_path)
+    elif robot_name == "bumi":
+        state_dim = 28
+        if str(kinematics_path) == "assets/robots/g1/g1_kinematics.json":
+            kinematics_path = "assets/robots/bumi/bumi_kinematics.json"
+        kinematics = BumiKinematics(kinematics_path)
+        if mjcf_path is None:
+            mjcf_path = "assets/robots/bumi/bumi3.xml"
     else:
-        qpos_np = np.asarray(qpos_36, dtype=np.float32)
-    if qpos_np.ndim == 3:
-        if qpos_np.shape[0] != 1:
-            raise ValueError(f"Expected batch dimension 1, got {qpos_np.shape}")
-        qpos_np = qpos_np[0]
-    if qpos_np.ndim != 2 or qpos_np.shape[-1] != 36:
-        raise ValueError(f"Expected qpos_36 shape (T,36), got {qpos_np.shape}")
+        raise ValueError(f"Unsupported robot_name={robot_name!r}")
+    qpos_np = _as_qpos_np(qpos_36, state_dim=state_dim, name="qpos")
 
     if camera_view == "iso":
         camera_azimuths = [iso_azimuth]
@@ -982,17 +1001,25 @@ def render_qpos_video(
     else:
         raise ValueError(f"Unsupported camera_view: {camera_view}")
 
-    kinematics = G1Kinematics(kinematics_path)
     body_state = kinematics.forward_kinematics(torch.from_numpy(qpos_np))
     body_pos_w = body_state["body_pos_w"].cpu().numpy()
-    urdf_data = parse_urdf(urdf_path)
-    xml_string = build_mjcf(
-        urdf_data,
-        offscreen_width=max(1, width if len(camera_azimuths) == 1 else width // len(camera_azimuths)),
-        offscreen_height=height,
-        scene_preset=scene_preset,
-    )
-    model = mujoco.MjModel.from_xml_string(xml_string)
+    if robot_name == "g1":
+        urdf_data = parse_urdf(urdf_path)
+        xml_string = build_mjcf(
+            urdf_data,
+            offscreen_width=max(1, width if len(camera_azimuths) == 1 else width // len(camera_azimuths)),
+            offscreen_height=height,
+            scene_preset=scene_preset,
+        )
+        model = mujoco.MjModel.from_xml_string(xml_string)
+    else:
+        resolved_mjcf = Path(str(mjcf_path)).expanduser().resolve()
+        model = mujoco.MjModel.from_xml_path(str(resolved_mjcf))
+        if int(model.nq) != state_dim or int(model.nu) != len(kinematics.joint_order):
+            raise ValueError(
+                f"BUMI render model dimensions mismatch: nq={model.nq}, nu={model.nu}, "
+                f"expected=({state_dim},{len(kinematics.joint_order)})"
+            )
     data = mujoco.MjData(model)
     if per_frame_info_lines is None:
         per_frame_info_lines = _frame_overlay_lines(frame_overlay_lines, len(qpos_np))
@@ -1018,7 +1045,12 @@ def render_qpos_video(
     metadata = {
         "num_frames": int(qpos_np.shape[0]),
         "fps": int(fps),
-        "urdf_path": str(Path(urdf_path).resolve()),
+        "robot_name": robot_name,
+        "state_dim": state_dim,
+        "quaternion_convention": "wxyz",
+        "joint_names": list(kinematics.joint_order),
+        "urdf_path": str(Path(urdf_path).resolve()) if robot_name == "g1" else None,
+        "mjcf_path": None if robot_name == "g1" else str(Path(str(mjcf_path)).resolve()),
         "camera_view": camera_view,
         "follow_mode": follow_mode,
         "scene_preset": scene_preset,
@@ -1053,7 +1085,14 @@ def render_qpos_comparison_video(
     left_ghost_qpos_36: torch.Tensor | np.ndarray | None = None,
     left_ghost_alpha: float = 0.28,
     camera_distance_scale: float = 1.0,
+    robot_name: str = "g1",
+    mjcf_path: str | Path | None = None,
 ) -> Path:
+    robot_name = str(robot_name).lower()
+    state_dim = {"g1": 36, "bumi": 28}.get(robot_name)
+    if state_dim is None:
+        raise ValueError(f"Unsupported robot_name={robot_name!r}")
+
     def as_qpos(value: torch.Tensor | np.ndarray, name: str) -> np.ndarray:
         if isinstance(value, torch.Tensor):
             qpos = value.detach().float().cpu().numpy()
@@ -1063,8 +1102,8 @@ def render_qpos_comparison_video(
             if qpos.shape[0] != 1:
                 raise ValueError(f"Expected {name} batch dimension 1, got {qpos.shape}")
             qpos = qpos[0]
-        if qpos.ndim != 2 or qpos.shape[-1] != 36:
-            raise ValueError(f"Expected {name} shape (T,36), got {qpos.shape}")
+        if qpos.ndim != 2 or qpos.shape[-1] != state_dim:
+            raise ValueError(f"Expected {name} shape (T,{state_dim}), got {qpos.shape}")
         return qpos
 
     left_np = as_qpos(left_qpos_36, "left_qpos_36")
@@ -1087,17 +1126,28 @@ def render_qpos_comparison_video(
     camera_azimuths = _camera_azimuths(camera_view, iso_azimuth, side_azimuth)
 
     panel_width = max(1, width // 2)
-    kinematics = G1Kinematics(kinematics_path)
-    urdf_data = parse_urdf(urdf_path)
-    xml_string = build_mjcf(
-        urdf_data,
-        offscreen_width=max(1, panel_width if len(camera_azimuths) == 1 else panel_width // len(camera_azimuths)),
-        offscreen_height=height,
-        scene_preset=scene_preset,
-    )
+    if robot_name == "g1":
+        kinematics: RobotKinematics = G1Kinematics(kinematics_path)
+        urdf_data = parse_urdf(urdf_path)
+        xml_string = build_mjcf(
+            urdf_data,
+            offscreen_width=max(1, panel_width if len(camera_azimuths) == 1 else panel_width // len(camera_azimuths)),
+            offscreen_height=height,
+            scene_preset=scene_preset,
+        )
+    else:
+        if str(kinematics_path) == "assets/robots/g1/g1_kinematics.json":
+            kinematics_path = "assets/robots/bumi/bumi_kinematics.json"
+        kinematics = BumiKinematics(kinematics_path)
+        resolved_mjcf = Path(mjcf_path or "assets/robots/bumi/bumi3.xml").expanduser().resolve()
+        xml_string = None
 
     def render_one(qpos_np: np.ndarray, title: str) -> np.ndarray:
-        model = mujoco.MjModel.from_xml_string(xml_string)
+        model = (
+            mujoco.MjModel.from_xml_string(xml_string)
+            if xml_string is not None
+            else mujoco.MjModel.from_xml_path(str(resolved_mjcf))
+        )
         data = mujoco.MjData(model)
         body_state = kinematics.forward_kinematics(torch.from_numpy(qpos_np))
         body_pos_w = body_state["body_pos_w"].cpu().numpy()
@@ -1123,6 +1173,8 @@ def render_qpos_comparison_video(
     if ghost_np is None:
         left_frames = render_one(left_np, left_title)
     else:
+        if robot_name != "g1":
+            raise ValueError("Translucent GT overlay is currently available only for the G1 URDF renderer")
         ghost_alpha = min(max(float(left_ghost_alpha), 0.0), 1.0)
         overlay_xml_string = build_mjcf(
             urdf_data,
@@ -1162,7 +1214,12 @@ def render_qpos_comparison_video(
     metadata = {
         "num_frames": int(num_frames),
         "fps": int(fps),
-        "urdf_path": str(Path(urdf_path).resolve()),
+        "robot_name": robot_name,
+        "state_dim": state_dim,
+        "quaternion_convention": "wxyz",
+        "joint_names": list(kinematics.joint_order),
+        "urdf_path": str(Path(urdf_path).resolve()) if robot_name == "g1" else None,
+        "mjcf_path": None if robot_name == "g1" else str(resolved_mjcf),
         "camera_view": camera_view,
         "follow_mode": follow_mode,
         "scene_preset": scene_preset,

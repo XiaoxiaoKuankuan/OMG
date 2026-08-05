@@ -16,6 +16,8 @@
   </p>
 </div>
 
+BUMI 原生数据转换、训练、生成和渲染请参阅 [BUMI 原生训练文档](docs/bumi_native_training.md)，G1 兼容迁移说明见 [MIGRATION_NOTES.md](MIGRATION_NOTES.md)。
+
 ## 新闻
 
 🚩 **2026 年 7 月**：OMG 荣获 **ExWBC@RSS 2026 Oral、RoboData@RSS 2026 Spotlight**，祝贺！<br>

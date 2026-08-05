@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import hashlib
 from typing import Any
 
 import numpy as np
@@ -14,8 +15,8 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from omg.data.episode_cache import EpisodeCachedG1MotionDataset
-from omg.data.lerobot_dataset import LeRobotG1MotionDataset
+from omg.data.episode_cache import EpisodeCachedG1MotionDataset, EpisodeCachedMotionDataset
+from omg.data.lerobot_dataset import LeRobotMotionDataset
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -31,7 +32,7 @@ def _resolve_dataset(
     representation_config: Path,
     paths_config: Path,
     split: str,
-) -> LeRobotG1MotionDataset:
+) -> LeRobotMotionDataset:
     data = _load_yaml(data_config)
     representation = _load_yaml(representation_config)
     paths = _load_yaml(paths_config)
@@ -42,19 +43,24 @@ def _resolve_dataset(
     root = OmegaConf.create({"paths": paths, "representation": representation, "dataset": raw_config})
     OmegaConf.resolve(root)
     config = OmegaConf.to_container(root.dataset, resolve=True)
-    if not isinstance(config, dict) or config.get("_target_") != "omg.data.lerobot_dataset.LeRobotG1MotionDataset":
-        raise TypeError("Episode-cache materialization requires LeRobotG1MotionDataset input")
+    supported_targets = {
+        "omg.data.lerobot_dataset.LeRobotMotionDataset",
+        "omg.data.lerobot_dataset.LeRobotG1MotionDataset",
+        "omg.data.lerobot_dataset.LeRobotBumiMotionDataset",
+    }
+    if not isinstance(config, dict) or config.get("_target_") not in supported_targets:
+        raise TypeError("Episode-cache materialization requires a LeRobotMotionDataset input")
     config["train_window_policy"] = "exhaustive"
     config["train_window_stride"] = int(config.get("train_window_stride", 1))
     config.setdefault("rotation_representation", representation.get("rotation_representation", "rot6d"))
     dataset = instantiate(OmegaConf.create(config))
-    if not isinstance(dataset, LeRobotG1MotionDataset):
-        raise TypeError(f"Expected LeRobotG1MotionDataset, got {type(dataset).__name__}")
+    if not isinstance(dataset, LeRobotMotionDataset):
+        raise TypeError(f"Expected LeRobotMotionDataset, got {type(dataset).__name__}")
     return dataset
 
 
 def write_episode_cache(
-    dataset: LeRobotG1MotionDataset,
+    dataset: LeRobotMotionDataset,
     *,
     output_root: Path,
     split: str,
@@ -138,7 +144,9 @@ def write_episode_cache(
         if shard_incomplete.exists():
             shutil.rmtree(shard_incomplete)
         shard_incomplete.mkdir()
-        frame_keys = ["qpos_36", "body_pos_w", "body_quat_w"]
+        robot_name = str(getattr(dataset, "robot_name", "g1"))
+        qpos_key = "qpos_36" if robot_name == "g1" else "qpos"
+        frame_keys = [qpos_key, "body_pos_w", "body_quat_w"]
         frame_keys.extend(key for key in ("audio_features", "has_audio", "human_motion", "has_human_motion") if key in group)
         for key in frame_keys:
             value = group[key].detach().cpu().numpy().astype(np.float32, copy=False)
@@ -189,8 +197,14 @@ def write_episode_cache(
         json.dumps(captions, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    robot_name = str(getattr(dataset, "robot_name", "g1"))
+    cache_format = (
+        EpisodeCachedG1MotionDataset.FORMAT
+        if robot_name == "g1"
+        else EpisodeCachedMotionDataset.FORMAT
+    )
     summary = {
-        "format": EpisodeCachedG1MotionDataset.FORMAT,
+        "format": cache_format,
         "source_repo_id": source_identity["repo_id"],
         "source_revision": source_identity["revision"],
         "split": split,
@@ -210,6 +224,20 @@ def write_episode_cache(
         "use_human_motion": bool(getattr(dataset, "use_human_motion", False)),
         "human_motion_dim": int(getattr(dataset, "human_motion_dim", 66)),
     }
+    if cache_format == EpisodeCachedMotionDataset.FORMAT:
+        kinematics_path = Path(dataset.kinematics.kinematics_path)
+        summary.update(
+            {
+                "robot_name": robot_name,
+                "state_dim": int(dataset.state_dim),
+                "feature_dim": int(dataset.codec.feature_dim),
+                "feature_body_count": int(dataset.codec.num_body_links),
+                "kinematics_sha256": hashlib.sha256(kinematics_path.read_bytes()).hexdigest(),
+                "representation_name": (
+                    f"{robot_name}_{dataset.codec.rotation_representation}_{dataset.codec.feature_dim}d"
+                ),
+            }
+        )
     (incomplete_root / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -219,7 +247,7 @@ def write_episode_cache(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Materialize exact frame-level G1 episode kinematics caches.")
+    parser = argparse.ArgumentParser(description="Materialize exact frame-level robot episode kinematics caches.")
     parser.add_argument("--data-config", type=Path, default=Path("configs/generation/data/omg_data_lerobot.yaml"))
     parser.add_argument(
         "--representation-config",

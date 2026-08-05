@@ -27,3 +27,5 @@ tmp/
 runtime_materialize_configs/
 inputs/
 run_scripts/
+# BUMI render meshes are exported locally from the adjacent robot_retarget repo.
+assets/robots/bumi/meshes/

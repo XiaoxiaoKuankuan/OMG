@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sys
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
 from omg.core.logging import Log
+from omg.generation.checkpoint_adapter import adapt_checkpoint
 
 
 _CKPT_PATH_OVERRIDE_KEYS = {"ckpt_path", "init_weights_only_ckpt"}
@@ -77,12 +79,23 @@ def _load_weights_only_checkpoint(
     checkpoint_path: str | os.PathLike[str],
     *,
     strict: bool = True,
-) -> None:
+    adapter: str | None = None,
+    report_path: str | os.PathLike[str] | None = None,
+) -> dict | None:
     path = Path(checkpoint_path)
     checkpoint: Any = torch.load(path, map_location="cpu")
     if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
         raise ValueError(f"Weights-only checkpoint does not contain a Lightning state_dict: {path}")
     state_dict = checkpoint["state_dict"]
+    if adapter is not None:
+        report = adapt_checkpoint(str(adapter), model, state_dict)
+        payload = report.to_dict()
+        if report_path is not None:
+            output = Path(report_path)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        Log.info("[CheckpointAdapter]: %s", json.dumps(payload, sort_keys=True))
+        return payload
     adapted_mismatched: list[str] = []
     skipped_mismatched: list[str] = []
     if not bool(strict):
@@ -124,6 +137,7 @@ def _load_weights_only_checkpoint(
         )
     else:
         Log.info("[Checkpoint]: initialized model weights from %s", path)
+    return None
 
 
 def _log_stage(stage: str, start: float | None = None) -> float:
@@ -166,6 +180,8 @@ def run(cfg: DictConfig) -> None:
             model,
             init_weights_only_ckpt,
             strict=bool(cfg.get("init_weights_strict", True)),
+            adapter=cfg.get("init_weights_adapter"),
+            report_path=Path(cfg.output_dir) / "checkpoint_adaptation_report.json",
         )
         _log_stage("load_weights_only_checkpoint", stage_start)
 
