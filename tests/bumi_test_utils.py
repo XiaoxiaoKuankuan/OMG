@@ -20,7 +20,14 @@ def standing_qpos(frames: int, *, dtype: torch.dtype = torch.float32) -> torch.T
     return qpos.expand(int(frames), -1).clone()
 
 
-def make_bumi_lerobot_dataset(root: Path, *, frames_per_split: int = 6) -> dict:
+def make_bumi_lerobot_dataset(
+    root: Path,
+    *,
+    frames_per_split: int = 6,
+    episodes_per_split: int = 1,
+    shard_by_episode: bool = False,
+    distinct_modalities: bool = False,
+) -> dict:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -32,36 +39,53 @@ def make_bumi_lerobot_dataset(root: Path, *, frames_per_split: int = 6) -> dict:
     splits = ("train", "val", "test")
     states_per_episode = []
     episode_rows = []
+    split_episode_ranges = {}
     cursor = 0
-    for episode_index, split in enumerate(splits):
-        states = standing_qpos(frames_per_split).numpy().astype(np.float32)
-        states[:, 0] += np.linspace(0.0, 0.02 * episode_index, frames_per_split, dtype=np.float32)
-        states_per_episode.append(states)
-        episode_rows.append(
-            {
-                "episode_index": episode_index,
-                "length": frames_per_split,
-                "dataset_from_index": cursor,
-                "dataset_to_index": cursor + frames_per_split,
-                "tasks": [f"test motion {episode_index}"],
-                "omg/split": split,
-                "omg/source_id": f"episode-{episode_index}",
-                "omg/dataset": "synthetic-test",
-                "omg/segment_index": 0,
-                "omg/source_start_frame": 0,
-                "omg/source_end_frame": frames_per_split,
-                "omg/has_text": True,
-                "omg/has_audio": True,
-                "omg/has_humanref": True,
-            }
-        )
-        cursor += frames_per_split
+    episode_index = 0
+    for split in splits:
+        split_episode_start = episode_index
+        for _ in range(int(episodes_per_split)):
+            states = standing_qpos(frames_per_split).numpy().astype(np.float32)
+            states[:, 0] += np.linspace(0.0, 0.02 * episode_index, frames_per_split, dtype=np.float32)
+            states_per_episode.append(states)
+            episode_rows.append(
+                {
+                    "episode_index": episode_index,
+                    "length": frames_per_split,
+                    "dataset_from_index": cursor,
+                    "dataset_to_index": cursor + frames_per_split,
+                    "tasks": [f"test motion {episode_index}"],
+                    "omg/split": split,
+                    "omg/source_id": f"episode-{episode_index}",
+                    "omg/dataset": "synthetic-test",
+                    "omg/segment_index": 0,
+                    "omg/source_start_frame": 0,
+                    "omg/source_end_frame": frames_per_split,
+                    "omg/has_text": True,
+                    "omg/has_audio": True,
+                    "omg/has_humanref": True,
+                }
+            )
+            cursor += frames_per_split
+            episode_index += 1
+        split_episode_ranges[split] = (split_episode_start, episode_index)
     states = np.concatenate(states_per_episode, axis=0)
     actions = np.concatenate(
         [np.concatenate((item[1:], item[-1:]), axis=0) for item in states_per_episode], axis=0
     )
-    frame_indices = np.tile(np.arange(frames_per_split, dtype=np.int64), len(splits))
-    episode_indices = np.repeat(np.arange(len(splits), dtype=np.int64), frames_per_split)
+    total_episodes = len(episode_rows)
+    frame_indices = np.tile(np.arange(frames_per_split, dtype=np.int64), total_episodes)
+    episode_indices = np.repeat(np.arange(total_episodes, dtype=np.int64), frames_per_split)
+    audio_features = np.zeros((states.shape[0], 35), dtype=np.float32)
+    human_motion = np.zeros((states.shape[0], 66), dtype=np.float32)
+    has_audio = np.ones(states.shape[0], dtype=np.bool_)
+    has_humanref = np.ones(states.shape[0], dtype=np.bool_)
+    if distinct_modalities:
+        global_indices = np.arange(states.shape[0], dtype=np.float32)
+        audio_features[:, 0] = global_indices
+        human_motion[:, 0] = global_indices + 1000.0
+        has_audio = (np.arange(states.shape[0]) % 3) != 0
+        has_humanref = (np.arange(states.shape[0]) % 4) != 0
     frame_table = pa.table(
         {
             "observation.state": pa.array(states.tolist(), type=pa.list_(pa.float32(), 28)),
@@ -72,21 +96,40 @@ def make_bumi_lerobot_dataset(root: Path, *, frames_per_split: int = 6) -> dict:
             "timestamp": pa.array(frame_indices.astype(np.float32) / 30.0),
             "task_index": pa.array(episode_indices),
             "omg.audio.feature": pa.array(
-                np.zeros((states.shape[0], 35), dtype=np.float32).tolist(),
+                audio_features.tolist(),
                 type=pa.list_(pa.float32(), 35),
             ),
-            "omg.condition.has_audio": pa.array(np.ones(states.shape[0], dtype=np.bool_)),
+            "omg.condition.has_audio": pa.array(has_audio),
             "omg.humanref.motion": pa.array(
-                np.zeros((states.shape[0], 66), dtype=np.float32).tolist(),
+                human_motion.tolist(),
                 type=pa.list_(pa.float32(), 66),
             ),
-            "omg.condition.has_humanref": pa.array(np.ones(states.shape[0], dtype=np.bool_)),
+            "omg.condition.has_humanref": pa.array(has_humanref),
         }
     )
-    pq.write_table(frame_table, data_dir / "file-000.parquet", compression="zstd")
-    pq.write_table(pa.Table.from_pylist(episode_rows), episode_dir / "file-000.parquet", compression="zstd")
+    episode_table = pa.Table.from_pylist(episode_rows)
+    if shard_by_episode:
+        for current_episode, row in enumerate(episode_rows):
+            pq.write_table(
+                frame_table.slice(int(row["dataset_from_index"]), int(row["length"])),
+                data_dir / f"file-{current_episode:03d}.parquet",
+                compression="zstd",
+            )
+            pq.write_table(
+                episode_table.slice(current_episode, 1),
+                episode_dir / f"file-{current_episode:03d}.parquet",
+                compression="zstd",
+            )
+    else:
+        pq.write_table(frame_table, data_dir / "file-000.parquet", compression="zstd")
+        pq.write_table(episode_table, episode_dir / "file-000.parquet", compression="zstd")
     pq.write_table(
-        pa.table({"task_index": pa.array([0, 1, 2]), "task": pa.array([row["tasks"][0] for row in episode_rows])}),
+        pa.table(
+            {
+                "task_index": pa.array(np.arange(total_episodes, dtype=np.int64)),
+                "task": pa.array([row["tasks"][0] for row in episode_rows]),
+            }
+        ),
         root / "meta" / "tasks.parquet",
         compression="zstd",
     )
@@ -95,11 +138,14 @@ def make_bumi_lerobot_dataset(root: Path, *, frames_per_split: int = 6) -> dict:
         "codebase_version": "v3.0",
         "robot_type": "bumi",
         "fps": 30.0,
-        "total_episodes": 3,
+        "total_episodes": total_episodes,
         "total_frames": int(states.shape[0]),
-        "total_tasks": 3,
-        "chunks_size": 3,
-        "splits": {name: f"{index}:{index + 1}" for index, name in enumerate(splits)},
+        "total_tasks": total_episodes,
+        "chunks_size": total_episodes,
+        "splits": {
+            name: f"{split_episode_ranges[name][0]}:{split_episode_ranges[name][1]}"
+            for name in splits
+        },
         "features": {
             "observation.state": {"dtype": "float32", "shape": [28]},
             "action": {"dtype": "float32", "shape": [28]},
@@ -135,6 +181,12 @@ def make_bumi_lerobot_dataset(root: Path, *, frames_per_split: int = 6) -> dict:
         "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
         "states": states,
         "actions": actions,
+        "audio_features": audio_features,
+        "human_motion": human_motion,
+        "has_audio": has_audio,
+        "has_humanref": has_humanref,
+        "episode_rows": episode_rows,
+        "split_episode_ranges": split_episode_ranges,
         "joint_names": joint_names,
     }
 

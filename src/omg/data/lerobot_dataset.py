@@ -705,16 +705,55 @@ class LeRobotMotionDataset(Dataset):
                 grouped_frames += episode_frames
                 episode_cursor += 1
             episode_group = self.episodes[group_start:episode_cursor]
-            data_start = int(episode_group[0]["data_start_row"])
-            data_end = int(episode_group[-1]["data_end_row"])
+            global_data_start = int(episode_group[0]["data_start_row"])
+            global_data_end = int(episode_group[-1]["data_end_row"])
+            local_data_start = global_data_start - self.frame_dataset_offset
+            local_data_end = global_data_end - self.frame_dataset_offset
+            group_episode_indices = [int(episode["episode_index"]) for episode in episode_group]
+            loaded_frame_count = len(self.frame_dataset)
+            if (
+                local_data_start < 0
+                or local_data_end <= local_data_start
+                or local_data_end > loaded_frame_count
+            ):
+                raise IndexError(
+                    "Episode kinematics group interval is outside the loaded split frame dataset: "
+                    f"split={self.split!r} "
+                    f"global_interval={global_data_start}:{global_data_end} "
+                    f"local_interval={local_data_start}:{local_data_end} "
+                    f"frame_dataset_offset={self.frame_dataset_offset} "
+                    f"loaded_frame_count={loaded_frame_count} "
+                    f"group_episode_indices={group_episode_indices}"
+                )
             columns = ["observation.state"]
             if self.use_audio:
                 columns.extend(("omg.audio.feature", "omg.condition.has_audio"))
             if self.use_human_motion:
                 columns.extend(("omg.humanref.motion", "omg.condition.has_humanref"))
-            raw = self.frame_dataset.select_columns(columns)[data_start:data_end]
+            raw = self.frame_dataset.select_columns(columns)[local_data_start:local_data_end]
+            qpos_array = np.asarray(raw["observation.state"], dtype=np.float32)
+            expected_frame_count = global_data_end - global_data_start
+            if qpos_array.ndim != 2:
+                raise ValueError(
+                    "Expected grouped observation.state to be two-dimensional: "
+                    f"split={self.split!r} episodes={group_episode_indices} "
+                    f"shape={tuple(qpos_array.shape)}"
+                )
+            if qpos_array.shape[0] != expected_frame_count:
+                raise ValueError(
+                    "Grouped observation.state frame count does not match its global interval: "
+                    f"split={self.split!r} episodes={group_episode_indices} "
+                    f"global_interval={global_data_start}:{global_data_end} "
+                    f"expected_frames={expected_frame_count} actual_frames={qpos_array.shape[0]}"
+                )
+            if qpos_array.shape[1] != self.state_dim:
+                raise ValueError(
+                    "Grouped observation.state dimension does not match the configured robot state: "
+                    f"split={self.split!r} episodes={group_episode_indices} "
+                    f"expected_state_dim={self.state_dim} actual_shape={tuple(qpos_array.shape)}"
+                )
             qpos_36 = torch.as_tensor(
-                np.asarray(raw["observation.state"], dtype=np.float32),
+                qpos_array,
                 dtype=torch.float32,
                 device=target_device,
             )
