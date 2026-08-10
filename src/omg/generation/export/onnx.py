@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ from omg.generation.denoisers.transformer import MotionTransformerBlock, RotaryS
 
 EXPORT_METADATA_KEY = "omg_export_metadata"
 EXPORT_FORMAT = "omg.denoiser_step"
-EXPORT_FORMAT_VERSION = 1
+EXPORT_FORMAT_VERSION = 2
 TENSORRT_BLOCKED_ONNX_OPS = frozenset({"SplitToSequence", "SequenceAt", "ConcatFromSequence"})
 
 
@@ -217,6 +218,34 @@ def _as_repo_or_abs_path(value: Any) -> str | None:
 def metadata_sidecar_path(onnx_path: str | Path) -> Path:
     path = Path(onnx_path)
     return path.with_suffix(path.suffix + ".meta.json")
+
+
+def _file_sha256(path: str | Path | None) -> str | None:
+    if path is None:
+        return None
+    resolved = Path(path).expanduser()
+    if not resolved.is_absolute():
+        resolved = Path(__file__).resolve().parents[4] / resolved
+    if not resolved.is_file():
+        return None
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _export_robot_name(value: Any) -> str:
+    """Return the stable wire/metadata robot identifier.
+
+    The G1 kinematics spec historically calls itself ``g1_29dof``.  Export
+    metadata intentionally uses ``g1`` so old and new G1 specs share one
+    deployment contract; the joint list and state dimension carry the exact
+    morphology identity.
+    """
+
+    name = str(value).strip().lower()
+    return "g1" if name == "g1" or name.startswith("g1_") else name
 
 
 class DenoiserStepExportModel(nn.Module):
@@ -458,6 +487,21 @@ def build_export_metadata(
         raise ValueError(f"ONNX diffusion-only planner supports diffusion_target=future, got {diffusion_target}")
 
     representation = model.representation
+    kinematics = representation.kinematics
+    robot_name = _export_robot_name(
+        getattr(representation, "robot_name", getattr(kinematics, "robot_name", "g1"))
+    )
+    state_dim = int(getattr(representation, "state_dim", getattr(kinematics, "qpos_dim", 36)))
+    joint_names = list(getattr(representation, "joint_names", getattr(kinematics, "joint_order", ())))
+    representation_name = str(
+        getattr(
+            representation,
+            "representation_name",
+            f"{robot_name}_{getattr(representation, 'rotation_representation', 'quat')}_{representation.feat_dim}d",
+        )
+    )
+    stats_path = _as_repo_or_abs_path(getattr(representation, "stats_path", None))
+    kinematics_path = _as_repo_or_abs_path(getattr(kinematics, "kinematics_path", None))
     text_encoder = getattr(model, "text_encoder", None)
     max_text_len = int(text_len or getattr(text_encoder, "max_length", 50))
     metadata = {
@@ -476,7 +520,13 @@ def build_export_metadata(
         "sample_alphas_cumprod": _to_list(diffusion.sample_alphas_cumprod),
         "sample_alphas_cumprod_prev": _to_list(diffusion.sample_alphas_cumprod_prev),
         "feat_dim": int(representation.feat_dim),
+        "robot_name": robot_name,
+        "state_dim": state_dim,
+        "joint_names": joint_names,
+        "representation_name": representation_name,
+        "quaternion_convention": "wxyz",
         "rotation_representation": str(getattr(representation, "rotation_representation", "quat")),
+        "rot6d_gradient_mode": str(getattr(representation, "rot6d_gradient_mode", "vanilla")),
         "sequence_length": int(representation.sequence_length),
         "num_prev_states": int(representation.num_prev_states),
         "canonical_frame_idx": int(representation.canonical_frame_idx),
@@ -491,8 +541,10 @@ def build_export_metadata(
         "human_motion_dim": int(getattr(model, "human_motion_dim", 0)),
         "text_encoder_model": None if text_encoder is None else str(getattr(text_encoder, "model_name", "")),
         "batch_size": int(batch_size),
-        "stats_path": _as_repo_or_abs_path(getattr(representation, "stats_path", None)),
-        "kinematics_path": _as_repo_or_abs_path(getattr(representation.kinematics, "kinematics_path", None)),
+        "stats_path": stats_path,
+        "stats_sha256": _file_sha256(stats_path),
+        "kinematics_path": kinematics_path,
+        "kinematics_sha256": _file_sha256(kinematics_path),
         "model_architecture": build_model_architecture_contract(model),
     }
     return metadata

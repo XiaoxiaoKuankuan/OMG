@@ -100,8 +100,9 @@ def body_angvel_from_quats(quats_wxyz: np.ndarray, fps: float) -> np.ndarray:
 
 def resample_qpos(qpos_36: np.ndarray, source_fps: float, target_fps: float) -> np.ndarray:
     qpos_36 = np.asarray(qpos_36, dtype=np.float32)
-    if qpos_36.ndim != 2 or qpos_36.shape[1] != 36:
-        raise ValueError(f"Expected qpos_36 shape (T,36), got {qpos_36.shape}")
+    if qpos_36.ndim != 2 or qpos_36.shape[1] < 8:
+        raise ValueError(f"Expected robot qpos shape (T,D) with D >= 8, got {qpos_36.shape}")
+    state_dim = int(qpos_36.shape[1])
     if np.isclose(float(source_fps), float(target_fps)):
         out = qpos_36.copy()
         out[:, 3:7] = np.stack([normalize_quat_wxyz(q) for q in out[:, 3:7]], axis=0)
@@ -115,8 +116,8 @@ def resample_qpos(qpos_36: np.ndarray, source_fps: float, target_fps: float) -> 
     target_frames = int(np.floor(duration * float(target_fps))) + 1
     target_t = np.arange(target_frames, dtype=np.float64) / float(target_fps)
     target_t = np.clip(target_t, source_t[0], source_t[-1])
-    out = np.empty((target_frames, 36), dtype=np.float32)
-    for dim in list(range(3)) + list(range(7, 36)):
+    out = np.empty((target_frames, state_dim), dtype=np.float32)
+    for dim in list(range(3)) + list(range(7, state_dim)):
         out[:, dim] = np.interp(target_t, source_t, qpos_36[:, dim]).astype(np.float32)
     quat_wxyz = np.stack([normalize_quat_wxyz(q) for q in qpos_36[:, 3:7]], axis=0)
     slerp = Slerp(source_t, Rotation.from_quat(quat_wxyz[:, [1, 2, 3, 0]]))

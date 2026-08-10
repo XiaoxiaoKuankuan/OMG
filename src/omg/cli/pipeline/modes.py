@@ -66,6 +66,26 @@ def _motion_seed_qpos(seed_qpos: np.ndarray, history_frames: int) -> np.ndarray:
     return np.asarray(seed_qpos[-history_frames:], dtype=np.float32)
 
 
+def _seed_motion_label(args: argparse.Namespace) -> str:
+    return str(getattr(args, "seed_motion_label", args.seed_motion))
+
+
+def _diffusion_video_path(args: argparse.Namespace, output_dir: Path, planner: OnnxDiffusionPlanner) -> Path:
+    if args.video_path:
+        return Path(args.video_path)
+    return output_dir / ("qpos_36_mujoco.mp4" if planner.robot_name == "g1" else "qpos_mujoco.mp4")
+
+
+def _render_robot_kwargs(planner: OnnxDiffusionPlanner) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "robot_name": planner.robot_name,
+        "kinematics_path": planner.kinematics_path,
+    }
+    if planner.robot_name == "bumi":
+        kwargs["mjcf_path"] = "assets/robots/bumi/bumi3.xml"
+    return kwargs
+
+
 def _plan_texts(args: argparse.Namespace, fallback_text: str) -> list[str]:
     condition_sequence = _condition_sequence(args)
     if condition_sequence is not None:
@@ -342,7 +362,7 @@ def _run_diffusion_only(
                 sequence_length=planner.sequence_length,
             )
             plan = planner.plan(
-                seed_qpos_36=current_seed_qpos,
+                seed_qpos=current_seed_qpos,
                 text=plan_text,
                 fps=target_fps,
                 num_frames=planner.sequence_length,
@@ -363,16 +383,17 @@ def _run_diffusion_only(
                     timing_ms=plan.metadata.get("timing_ms", {}),
                 )
             )
-            plan_qpos_chunks.append(plan.qpos_36)
+            plan_qpos_chunks.append(plan.qpos)
             plan_feature_chunks.append(plan.motion_features)
             current_seed_qpos = _append_reference_history(
                 current_seed_qpos,
-                plan.qpos_36,
+                plan.qpos,
                 planner.num_prev_states,
             )
         metadata = {
             "mode": args.mode,
-            "seed_motion": str(args.seed_motion),
+            "seed_motion": _seed_motion_label(args),
+            "history_source": str(args.history_source),
             "audio_features": describe_pipeline_audio_features(audio_features),
             "human_motion": describe_pipeline_human_motion(human_motion),
             "plan_frames": int(planner.sequence_length),
@@ -386,9 +407,12 @@ def _run_diffusion_only(
             fps=target_fps,
             output_dir=output_dir,
             metadata=metadata,
+            robot_name=planner.robot_name,
+            joint_names=planner.joint_names,
+            representation_name=planner.representation_name,
         )
         if args.video:
-            video_path = Path(args.video_path) if args.video_path else output_dir / "qpos_36_mujoco.mp4"
+            video_path = _diffusion_video_path(args, output_dir, planner)
             video_seed_qpos = _motion_seed_qpos(seed_qpos, planner.num_prev_states)
             video_qpos = np.concatenate([video_seed_qpos, *plan_qpos_chunks], axis=0)
             prompt_by_generated_frame = []
@@ -411,6 +435,7 @@ def _run_diffusion_only(
                     prompt_by_generated_frame=prompt_by_generated_frame,
                     chunk_frame_count=planner.sequence_length,
                 ),
+                **_render_robot_kwargs(planner),
             )
             print(f"video={Path(rendered).resolve()}")
         print(output_dir.resolve())
@@ -436,7 +461,7 @@ def _run_diffusion_only(
         allow_multi_chunk=True,
     )
     plan = planner.plan(
-        seed_qpos_36=seed_qpos,
+        seed_qpos=seed_qpos,
         text=plan_text,
         fps=target_fps,
         num_frames=args.num_frames,
@@ -452,17 +477,18 @@ def _run_diffusion_only(
         output_dir,
         extra_metadata={
             "mode": args.mode,
-            "seed_motion": str(args.seed_motion),
+            "seed_motion": _seed_motion_label(args),
+            "history_source": str(args.history_source),
             **_text_metadata(args, text),
             "audio_features": describe_pipeline_audio_features(audio_features),
             "human_motion": describe_pipeline_human_motion(human_motion),
         },
     )
     if args.video:
-        video_path = Path(args.video_path) if args.video_path else output_dir / "qpos_36_mujoco.mp4"
+        video_path = _diffusion_video_path(args, output_dir, planner)
         video_seed_qpos = _motion_seed_qpos(seed_qpos, planner.num_prev_states)
         video_qpos = np.concatenate(
-            [video_seed_qpos, np.asarray(plan.qpos_36, dtype=np.float32)],
+            [video_seed_qpos, np.asarray(plan.qpos, dtype=np.float32)],
             axis=0,
         )
         rendered = render_qpos_video(
@@ -479,7 +505,8 @@ def _run_diffusion_only(
             overlay_lines=[
                 f"text: {plan_text}",
             ],
-            frame_overlay_lines=_motion_seed_frame_overlay(video_seed_qpos.shape[0], plan.qpos_36.shape[0]),
+            frame_overlay_lines=_motion_seed_frame_overlay(video_seed_qpos.shape[0], plan.qpos.shape[0]),
+            **_render_robot_kwargs(planner),
         )
         print(f"video={Path(rendered).resolve()}")
     print(output_dir.resolve())

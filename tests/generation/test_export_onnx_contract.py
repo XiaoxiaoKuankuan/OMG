@@ -14,6 +14,9 @@ from omg.generation.export import (
 
 class _FakeKinematics:
     kinematics_path = "assets/robots/g1/g1_kinematics.json"
+    robot_name = "g1"
+    qpos_dim = 36
+    joint_order = tuple(f"joint_{index}" for index in range(29))
 
 
 class _FakeRepresentation(nn.Module):
@@ -25,6 +28,12 @@ class _FakeRepresentation(nn.Module):
         self.canonical_frame_idx = 1
         self.stats_path = "assets/stats/fake.json"
         self.kinematics = _FakeKinematics()
+        self.robot_name = "g1"
+        self.state_dim = 36
+        self.joint_names = self.kinematics.joint_order
+        self.representation_name = "g1_fake_3d"
+        self.rotation_representation = "quat"
+        self.rot6d_gradient_mode = "vanilla"
         self.register_buffer("mean", torch.zeros(3))
         self.register_buffer("std", torch.ones(3))
 
@@ -124,6 +133,11 @@ def test_build_export_metadata_contract():
     assert metadata["sequence_length"] == 5
     assert metadata["num_prev_states"] == 2
     assert metadata["feat_dim"] == 3
+    assert metadata["robot_name"] == "g1"
+    assert metadata["state_dim"] == 36
+    assert metadata["joint_names"] == list(_FakeKinematics.joint_order)
+    assert metadata["representation_name"] == "g1_fake_3d"
+    assert metadata["quaternion_convention"] == "wxyz"
     assert metadata["text_dim"] == 6
     assert metadata["text_max_length"] == 7
     assert metadata["batch_size"] == 2
@@ -131,6 +145,14 @@ def test_build_export_metadata_contract():
     assert metadata["export_target"] == "tensorrt"
     assert metadata["tensorrt_compatible"] is True
     assert metadata["sample_timestep_map"] == [0, 9]
+
+
+def test_export_metadata_normalizes_legacy_g1_robot_name():
+    model = _FakeModel()
+    model.representation.robot_name = "g1_29dof"
+    model.representation.kinematics.robot_name = "g1_29dof"
+    metadata = build_export_metadata(model, opset=18, text_len=7, batch_size=2, dynamo=True)
+    assert metadata["robot_name"] == "g1"
 
 
 

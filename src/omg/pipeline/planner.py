@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -11,7 +12,7 @@ import torch
 
 from omg.generation.conditions.t5 import FrozenT5TextEncoder
 from omg.generation.export import load_export_metadata
-from omg.motion.representation import G1MotionRepresentation
+from omg.motion.representation import BumiMotionRepresentation, G1MotionRepresentation, RobotMotionRepresentation
 from omg.runtime.onnx_providers import (
     DEFAULT_DIFFUSION_ONNX_PROVIDERS,
     DEFAULT_TENSORRT_ONNX_PROVIDERS,
@@ -39,6 +40,34 @@ class MotionPlan:
     fps: float
     metadata: dict[str, Any] = field(default_factory=dict)
     continuation_state: DiffusionContinuationState | None = None
+
+    def __post_init__(self) -> None:
+        qpos = np.asarray(self.qpos_36, dtype=np.float32)
+        if qpos.ndim != 2 or qpos.shape[0] <= 0 or qpos.shape[1] < 8:
+            raise ValueError(f"MotionPlan qpos must have shape (T,D) with T > 0 and D >= 8, got {qpos.shape}")
+        if not np.isfinite(qpos).all():
+            raise ValueError("MotionPlan qpos contains non-finite values")
+        features = np.asarray(self.motion_features, dtype=np.float32)
+        if features.ndim != 2 or features.shape[0] != qpos.shape[0]:
+            raise ValueError(
+                "MotionPlan motion_features must have shape (T,F) matching qpos frames, "
+                f"got {features.shape} for qpos {qpos.shape}"
+            )
+        if not np.isfinite(features).all():
+            raise ValueError("MotionPlan motion_features contains non-finite values")
+        object.__setattr__(self, "qpos_36", qpos.astype(np.float32, copy=False))
+        object.__setattr__(self, "motion_features", features.astype(np.float32, copy=False))
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+    @property
+    def qpos(self) -> np.ndarray:
+        """Robot-generic qpos. ``qpos_36`` remains as the G1 compatibility alias."""
+
+        return self.qpos_36
+
+    @property
+    def state_dim(self) -> int:
+        return int(self.qpos.shape[1])
 
 
 @dataclass(frozen=True)
@@ -134,15 +163,109 @@ def _providers(value: Sequence[str] | str | None, metadata: dict[str, Any] | Non
     return list(DEFAULT_DIFFUSION_ONNX_PROVIDERS)
 
 
-def _coerce_seed_qpos(qpos_36: np.ndarray) -> np.ndarray:
-    qpos = np.asarray(qpos_36, dtype=np.float32)
-    if qpos.ndim != 2 or qpos.shape[1] != QPOS_DIM:
-        raise ValueError(f"Expected seed qpos_36 shape (T,{QPOS_DIM}), got {qpos.shape}")
+def _coerce_seed_qpos(
+    value: np.ndarray,
+    *,
+    state_dim: int = QPOS_DIM,
+    name: str = "seed qpos",
+) -> np.ndarray:
+    qpos = np.asarray(value, dtype=np.float32)
+    expected_dim = int(state_dim)
+    if expected_dim < 8:
+        raise ValueError(f"state_dim must be at least 8, got {expected_dim}")
+    if qpos.ndim != 2 or qpos.shape[1] != expected_dim:
+        raise ValueError(f"Expected {name} shape (T,{expected_dim}), got {qpos.shape}")
     if qpos.shape[0] <= 0:
-        raise ValueError("Seed qpos_36 is empty")
+        raise ValueError(f"{name} is empty")
     if not np.isfinite(qpos).all():
-        raise ValueError("Seed qpos_36 contains non-finite values")
+        raise ValueError(f"{name} contains non-finite values")
     return qpos.astype(np.float32, copy=False)
+
+
+def _resolve_runtime_asset(path: str | Path) -> Path:
+    value = Path(path).expanduser()
+    if value.is_absolute():
+        return value.resolve()
+    return (Path(__file__).resolve().parents[3] / value).resolve()
+
+
+def _canonical_robot_name(value: Any) -> str:
+    name = str(value).strip().lower()
+    if name == "g1" or name.startswith("g1_"):
+        return "g1"
+    if name == "bumi":
+        return "bumi"
+    raise ValueError(f"Unsupported ONNX robot_name={name!r}; expected g1 or bumi")
+
+
+def _validate_runtime_asset(path: str | Path, expected_sha256: str | None, *, name: str) -> Path:
+    resolved = _resolve_runtime_asset(path)
+    if not resolved.is_file():
+        raise FileNotFoundError(f"ONNX {name} file not found: {resolved}")
+    if expected_sha256:
+        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        if digest != str(expected_sha256):
+            raise ValueError(
+                f"ONNX {name} SHA256 mismatch for {resolved}: expected {expected_sha256}, got {digest}"
+            )
+    return resolved
+
+
+def _build_runtime_representation(
+    metadata: dict[str, Any],
+    *,
+    device: torch.device,
+    stats_path_override: str | Path | None = None,
+    kinematics_path_override: str | Path | None = None,
+) -> RobotMotionRepresentation:
+    robot_name = _canonical_robot_name(metadata.get("robot_name", "g1"))
+    stats_path = stats_path_override or metadata.get("stats_path")
+    kinematics_path = kinematics_path_override or metadata.get("kinematics_path")
+    rotation_representation = metadata.get("rotation_representation")
+    if stats_path is None or kinematics_path is None or rotation_representation is None:
+        raise ValueError(
+            "Diffusion metadata must include stats_path, kinematics_path, and rotation_representation. "
+            "Re-export the ONNX model with the current exporter."
+        )
+    resolved_stats = _validate_runtime_asset(
+        stats_path,
+        metadata.get("stats_sha256"),
+        name="representation stats",
+    )
+    resolved_kinematics = _validate_runtime_asset(
+        kinematics_path,
+        metadata.get("kinematics_sha256"),
+        name="kinematics",
+    )
+    common = {
+        "stats_path": resolved_stats,
+        "kinematics_path": resolved_kinematics,
+        "num_prev_states": int(metadata["num_prev_states"]),
+        "canonical_frame_idx": int(metadata["canonical_frame_idx"]),
+        "feat_dim": int(metadata["feat_dim"]),
+        "sequence_length": int(metadata["sequence_length"]),
+        "rotation_representation": str(rotation_representation),
+        "rot6d_gradient_mode": str(metadata.get("rot6d_gradient_mode", "vanilla")),
+    }
+    if robot_name == "g1":
+        representation: RobotMotionRepresentation = G1MotionRepresentation(**common)
+    elif robot_name == "bumi":
+        representation = BumiMotionRepresentation(**common)
+    representation = representation.to(device)
+
+    expected_state_dim = int(metadata.get("state_dim", 36 if robot_name == "g1" else representation.state_dim))
+    if representation.state_dim != expected_state_dim:
+        raise ValueError(
+            f"ONNX state_dim={expected_state_dim} does not match {robot_name} representation "
+            f"state_dim={representation.state_dim}"
+        )
+    expected_joint_names = tuple(str(name) for name in metadata.get("joint_names", ()))
+    if expected_joint_names and expected_joint_names != tuple(representation.joint_names):
+        raise ValueError("ONNX joint_names do not match the runtime kinematics joint order")
+    quaternion_convention = str(metadata.get("quaternion_convention", "wxyz")).lower()
+    if quaternion_convention != "wxyz":
+        raise ValueError(f"Unsupported ONNX quaternion_convention={quaternion_convention!r}; expected wxyz")
+    return representation
 
 
 def _coerce_audio_feature_chunks(
@@ -283,6 +406,8 @@ class OnnxDiffusionPlanner:
         metadata_path: str | Path | None = None,
         providers: Sequence[str] | str | None = None,
         text_encoder_model: str | None = None,
+        representation_stats_path: str | Path | None = None,
+        kinematics_path: str | Path | None = None,
         torch_device: str | torch.device | None = "auto",
         seed: int = 0,
         compile_history_encoder: bool | None = None,
@@ -386,23 +511,18 @@ class OnnxDiffusionPlanner:
         ):
             raise ValueError("Diffusion metadata timestep arrays must have identical shape")
 
-        stats_path = self.metadata.get("stats_path")
-        kinematics_path = self.metadata.get("kinematics_path")
-        rotation_representation = self.metadata.get("rotation_representation")
-        if stats_path is None or kinematics_path is None or rotation_representation is None:
-            raise ValueError(
-                "Diffusion metadata must include stats_path, kinematics_path, and rotation_representation. "
-                "Re-export the ONNX model with the current exporter."
-            )
-        self.representation = G1MotionRepresentation(
-            stats_path=stats_path,
-            kinematics_path=kinematics_path,
-            num_prev_states=self.num_prev_states,
-            canonical_frame_idx=int(self.metadata["canonical_frame_idx"]),
-            feat_dim=self.feat_dim,
-            sequence_length=self.sequence_length,
-            rotation_representation=str(rotation_representation),
-        ).to(self.torch_device)
+        self.representation = _build_runtime_representation(
+            self.metadata,
+            device=self.torch_device,
+            stats_path_override=representation_stats_path,
+            kinematics_path_override=kinematics_path,
+        )
+        self.robot_name = _canonical_robot_name(self.metadata.get("robot_name", self.representation.robot_name))
+        self.state_dim = int(self.representation.state_dim)
+        self.joint_names = tuple(self.representation.joint_names)
+        self.representation_name = str(self.representation.representation_name)
+        self.stats_path = str(self.representation.stats_path)
+        self.kinematics_path = str(self.representation.kinematics.kinematics_path)
         if compile_history_encoder is None:
             compile_history_encoder = self.torch_device.type == "cuda" and hasattr(torch, "compile")
         self.compile_history_encoder = bool(compile_history_encoder)
@@ -420,6 +540,22 @@ class OnnxDiffusionPlanner:
                 output_dim=self.text_dim,
             ).to(self.torch_device).eval()
         self._text_condition_cache: dict[str, tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = {}
+
+    def default_seed_qpos(self) -> np.ndarray:
+        """Return the representation's grounded default history without loading a dataset."""
+
+        with torch.no_grad():
+            qpos = self.representation.get_default_prev_qpos(
+                batch_size=1,
+                device=self.torch_device,
+                dtype=torch.float32,
+            )
+        expected = (1, self.num_prev_states, self.state_dim)
+        if tuple(qpos.shape) != expected:
+            raise ValueError(f"Default history has shape {tuple(qpos.shape)}, expected {expected}")
+        if not torch.isfinite(qpos).all():
+            raise ValueError("Default history contains non-finite values")
+        return qpos[0].detach().cpu().numpy().astype(np.float32, copy=False)
 
     def _encode_text(self, text: str) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         if self.text_encoder is None:
@@ -1007,7 +1143,11 @@ class OnnxDiffusionPlanner:
     ) -> _ContinuationInit:
         start_step = _continuation_start_step(self.sample_timestep_map.shape[0], continuation_steps)
         cursor = int(previous_plan_cursor_frames)
-        previous_qpos = _coerce_seed_qpos(previous_plan.qpos_36)
+        previous_qpos = _coerce_seed_qpos(
+            previous_plan.qpos,
+            state_dim=self.state_dim,
+            name="previous plan qpos",
+        )
         if cursor < 0 or cursor >= previous_qpos.shape[0]:
             raise ValueError(
                 f"previous_plan_cursor_frames must be in [0, {previous_qpos.shape[0] - 1}], got {cursor}"
@@ -1039,7 +1179,8 @@ class OnnxDiffusionPlanner:
     def plan(
         self,
         *,
-        seed_qpos_36: np.ndarray,
+        seed_qpos_36: np.ndarray | None = None,
+        seed_qpos: np.ndarray | None = None,
         text: str,
         fps: float,
         num_frames: int,
@@ -1066,7 +1207,12 @@ class OnnxDiffusionPlanner:
             raise ValueError(
                 f"continuation_steps must be at most {self.sample_timestep_map.shape[0]}, got {continuation_steps_int}"
             )
-        qpos_seed = _coerce_seed_qpos(seed_qpos_36)
+        if seed_qpos is not None and seed_qpos_36 is not None:
+            raise ValueError("Pass only one of seed_qpos or the legacy seed_qpos_36 argument")
+        seed_value = seed_qpos if seed_qpos is not None else seed_qpos_36
+        if seed_value is None:
+            raise ValueError("seed_qpos is required")
+        qpos_seed = _coerce_seed_qpos(seed_value, state_dim=self.state_dim)
         if not np.isfinite(float(fps)) or float(fps) <= 0.0:
             raise ValueError(f"fps must be positive and finite, got {fps}")
         scale = self.cfg_scale if cfg_scale is None else float(cfg_scale)
@@ -1218,7 +1364,7 @@ class OnnxDiffusionPlanner:
                 decode_representation_seconds += time.perf_counter() - part_started
 
                 part_started = time.perf_counter()
-                qpos = self.representation.compose_qpos_36(decoded, canon_root_pos, canon_root_quat)
+                qpos = self.representation.compose_qpos(decoded, canon_root_pos, canon_root_quat)
                 _sync_torch_device(self.torch_device)
                 decode_compose_qpos_seconds += time.perf_counter() - part_started
 
@@ -1306,6 +1452,15 @@ class OnnxDiffusionPlanner:
         }
         metadata = {
             "diffusion_onnx": str(self.onnx_path),
+            "robot_name": self.robot_name,
+            "state_dim": self.state_dim,
+            "joint_names": list(self.joint_names),
+            "representation_name": self.representation_name,
+            "quaternion_convention": "wxyz",
+            "stats_path": self.stats_path,
+            "stats_sha256": self.metadata.get("stats_sha256"),
+            "kinematics_path": self.kinematics_path,
+            "kinematics_sha256": self.metadata.get("kinematics_sha256"),
             "providers": self.providers,
             "active_providers": list(self.session.get_providers()),
             "batch_size": self.batch_size,
@@ -1357,14 +1512,21 @@ class OnnxDiffusionPlanner:
 def save_motion_plan(plan: MotionPlan, output_dir: str | Path, *, extra_metadata: dict[str, Any] | None = None) -> Path:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    np.save(out / "qpos_36.npy", plan.qpos_36.astype(np.float32, copy=False))
-    np.savez_compressed(
-        out / "reference_motion.npz",
-        qpos_36=plan.qpos_36.astype(np.float32, copy=False),
-        motion_features=plan.motion_features.astype(np.float32, copy=False),
-        fps=np.asarray([float(plan.fps)], dtype=np.float32),
-    )
+    qpos = plan.qpos.astype(np.float32, copy=False)
+    np.save(out / "qpos.npy", qpos)
+    if plan.state_dim == QPOS_DIM:
+        np.save(out / "qpos_36.npy", qpos)
+    reference_payload: dict[str, np.ndarray] = {
+        "qpos": qpos,
+        "motion_features": plan.motion_features.astype(np.float32, copy=False),
+        "fps": np.asarray([float(plan.fps)], dtype=np.float32),
+    }
+    if plan.state_dim == QPOS_DIM:
+        reference_payload["qpos_36"] = qpos
+    np.savez_compressed(out / "reference_motion.npz", **reference_payload)
     metadata = dict(plan.metadata)
+    metadata.setdefault("state_dim", plan.state_dim)
+    metadata.setdefault("quaternion_convention", "wxyz")
     if extra_metadata:
         metadata.update(extra_metadata)
     (out / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")

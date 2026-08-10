@@ -28,6 +28,8 @@ def _parse_args() -> argparse.Namespace:
         help="ONNX Runtime providers. Defaults to TensorRT then CUDA for TensorRT-compatible exports.",
     )
     parser.add_argument("--text-encoder-model", default=None)
+    parser.add_argument("--representation-stats-path", default=None)
+    parser.add_argument("--kinematics-path", default=None)
     parser.add_argument("--torch-device", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tensorrt-fp16", action=argparse.BooleanOptionalAction, default=True)
@@ -36,6 +38,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dit-cache-threshold", type=float, default=0.995)
     parser.add_argument("--dit-cache-warmup-steps", type=int, default=4)
     parser.add_argument("--dit-cache-max-consecutive", type=int, default=2)
+    parser.add_argument(
+        "--compile-history-encoder",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Compile the robot history encoder with torch.compile; defaults to enabled on CUDA.",
+    )
     parser.add_argument("--include-motion-features", action="store_true")
     parser.add_argument("--log-jsonl", default=None)
     return parser.parse_args()
@@ -90,6 +98,8 @@ def main() -> None:
         cfg_human_scale=args.cfg_human_scale,
         providers=args.providers,
         text_encoder_model=args.text_encoder_model,
+        representation_stats_path=args.representation_stats_path,
+        kinematics_path=args.kinematics_path,
         torch_device=args.torch_device,
         seed=args.seed,
         tensorrt_fp16=bool(args.tensorrt_fp16),
@@ -98,12 +108,14 @@ def main() -> None:
         dit_cache_threshold=args.dit_cache_threshold,
         dit_cache_warmup_steps=args.dit_cache_warmup_steps,
         dit_cache_max_consecutive=args.dit_cache_max_consecutive,
+        compile_history_encoder=args.compile_history_encoder,
         include_motion_features=bool(args.include_motion_features),
     )
     service = RealtimeDiffusionPlannerService(config)
     with ZmqPlanServer(args.bind) as server:
         print(
             f"[realtime-planner] bind={args.bind} onnx={Path(args.diffusion_onnx).expanduser()} "
+            f"robot={service.planner.robot_name} state_dim={service.planner.state_dim} "
             f"frames={service.plan_frames} tensorrt_fp16={bool(args.tensorrt_fp16)} dit_cache={bool(args.dit_cache)} "
             f"condition_source=request",
             flush=True,

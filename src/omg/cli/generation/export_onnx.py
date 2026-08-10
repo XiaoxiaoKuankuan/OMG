@@ -52,7 +52,8 @@ def _default_output_path(exp: str, ckpt_path: str | Path) -> Path:
 
 def _format_contract(metadata: dict) -> str:
     return (
-        f"format={metadata['format']} seq_len={metadata['sequence_length']} "
+        f"format={metadata['format']} robot={metadata.get('robot_name', 'g1')} "
+        f"state_dim={metadata.get('state_dim', 36)} seq_len={metadata['sequence_length']} "
         f"history={metadata['num_prev_states']} feat_dim={metadata['feat_dim']} "
         f"text_dim={metadata['text_dim']} audio={bool(metadata.get('use_audio', False))} "
         f"audio_dim={metadata.get('audio_dim')} humanref={bool(metadata.get('use_human_motion', False))} "

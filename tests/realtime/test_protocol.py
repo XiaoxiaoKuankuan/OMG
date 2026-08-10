@@ -58,3 +58,52 @@ def test_motion_plan_chunk_round_trip_with_features() -> None:
 def test_rejects_invalid_qpos_shape() -> None:
     with pytest.raises(ValueError, match="qpos_36_history"):
         RobotStateRequest(qpos_36_history=np.zeros((10, 35), dtype=np.float32), history_fps=30.0, tracker_frame=0)
+
+
+def test_bumi_request_and_plan_round_trip_use_generic_wire_keys() -> None:
+    qpos = np.zeros((10, 28), dtype=np.float32)
+    qpos[:, 2] = 0.55
+    qpos[:, 3] = 1.0
+    identity = {"robot_name": "bumi", "state_dim": 28}
+    request = RobotStateRequest(
+        qpos_36_history=qpos,
+        history_fps=30.0,
+        tracker_frame=0,
+        metadata=identity,
+    )
+    header_bytes, payload_bytes = request.to_message()
+    header, arrays = decode_message(header_bytes, payload_bytes)
+    assert "qpos_history" in arrays
+    assert "qpos_36_history" not in arrays
+    restored_request = RobotStateRequest.from_message(header, arrays)
+    assert restored_request.robot_name == "bumi"
+    assert restored_request.state_dim == 28
+    np.testing.assert_allclose(restored_request.qpos_history, qpos)
+
+    plan = MotionPlanChunk(
+        qpos_36=np.repeat(qpos[:1], 60, axis=0),
+        motion_features=np.zeros((60, 93), dtype=np.float32),
+        fps=30.0,
+        request_id=request.request_id,
+        plan_id=0,
+        request_tracker_frame=0,
+        metadata=identity,
+    )
+    header, arrays = decode_message(*plan.to_message())
+    assert "qpos" in arrays
+    assert "qpos_36" not in arrays
+    restored_plan = MotionPlanChunk.from_message(header, arrays)
+    assert restored_plan.qpos.shape == (60, 28)
+    assert restored_plan.robot_name == "bumi"
+
+
+def test_protocol_normalizes_legacy_g1_robot_name() -> None:
+    qpos = np.zeros((10, 36), dtype=np.float32)
+    qpos[:, 3] = 1.0
+    request = RobotStateRequest(
+        qpos_36_history=qpos,
+        history_fps=30.0,
+        tracker_frame=0,
+        metadata={"robot_name": "g1_29dof", "state_dim": 36},
+    )
+    assert request.robot_name == "g1"

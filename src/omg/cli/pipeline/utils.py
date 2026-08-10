@@ -123,11 +123,24 @@ def _save_plan_chunks(
     fps: float,
     output_dir: Path,
     metadata: dict,
+    robot_name: str = "g1",
+    joint_names: list[str] | tuple[str, ...] | None = None,
+    representation_name: str | None = None,
 ) -> Path:
     qpos = np.concatenate(qpos_chunks, axis=0).astype(np.float32, copy=False)
     features = np.concatenate(feature_chunks, axis=0).astype(np.float32, copy=False)
+    plan_metadata = dict(metadata)
+    plan_metadata.update(
+        {
+            "robot_name": str(robot_name),
+            "state_dim": int(qpos.shape[1]),
+            "joint_names": list(joint_names or ()),
+            "representation_name": representation_name,
+            "quaternion_convention": "wxyz",
+        }
+    )
     return save_motion_plan(
-        MotionPlan(qpos_36=qpos, motion_features=features, fps=float(fps), metadata=metadata),
+        MotionPlan(qpos_36=qpos, motion_features=features, fps=float(fps), metadata=plan_metadata),
         output_dir,
     )
 

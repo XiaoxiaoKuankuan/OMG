@@ -31,6 +31,8 @@ class RealtimePlannerConfig:
     cfg_human_scale: float | None = None
     providers: Sequence[str] | str | None = None
     text_encoder_model: str | None = None
+    representation_stats_path: str | Path | None = None
+    kinematics_path: str | Path | None = None
     torch_device: str = "auto"
     seed: int = 0
     tensorrt_fp16: bool = True
@@ -39,6 +41,7 @@ class RealtimePlannerConfig:
     dit_cache_threshold: float = 0.995
     dit_cache_warmup_steps: int = 4
     dit_cache_max_consecutive: int = 2
+    compile_history_encoder: bool | None = None
     include_motion_features: bool = False
     audio_fps: float = 30.0
     tracker_fps: float = 50.0
@@ -54,6 +57,8 @@ class RealtimeDiffusionPlannerService:
             config.diffusion_onnx,
             providers=config.providers,
             text_encoder_model=config.text_encoder_model,
+            representation_stats_path=config.representation_stats_path,
+            kinematics_path=config.kinematics_path,
             torch_device=config.torch_device,
             seed=config.seed,
             tensorrt_fp16=config.tensorrt_fp16,
@@ -62,6 +67,7 @@ class RealtimeDiffusionPlannerService:
             dit_cache_threshold=config.dit_cache_threshold,
             dit_cache_warmup_steps=config.dit_cache_warmup_steps,
             dit_cache_max_consecutive=config.dit_cache_max_consecutive,
+            compile_history_encoder=config.compile_history_encoder,
         )
         self._condition_sequence_cache: dict[
             tuple[str, str, float, str, int | None, str],
@@ -202,6 +208,12 @@ class RealtimeDiffusionPlannerService:
         }
 
     def plan(self, request: RobotStateRequest) -> MotionPlanChunk:
+        if request.robot_name != self.planner.robot_name or request.state_dim != self.planner.state_dim:
+            raise ValueError(
+                "Realtime request robot identity does not match the ONNX planner: "
+                f"request={request.robot_name}/{request.state_dim}, "
+                f"planner={self.planner.robot_name}/{self.planner.state_dim}"
+            )
         plan_id = self._next_plan_id
         condition_text, condition_audio, condition_human, condition_metadata = self._condition_inputs_for_request(
             request
@@ -217,7 +229,7 @@ class RealtimeDiffusionPlannerService:
         plan_start_wall_time = time.time()
         started = time.perf_counter()
         plan = self.planner.plan(
-            seed_qpos_36=request.qpos_36_history,
+            seed_qpos=request.qpos_history,
             text=text,
             fps=request.history_fps,
             num_frames=self.plan_frames,
@@ -248,7 +260,9 @@ class RealtimeDiffusionPlannerService:
                     "buffer_remaining_frames": int(request.buffer_remaining_frames),
                     "last_plan_id": request.last_plan_id,
                     "history_fps": float(request.history_fps),
-                    "history_frames": int(request.qpos_36_history.shape[0]),
+                    "history_frames": int(request.qpos_history.shape[0]),
+                    "robot_name": request.robot_name,
+                    "state_dim": request.state_dim,
                     "metadata": request.metadata,
                 },
                 "planning_latency_seconds": float(latency),
@@ -258,7 +272,7 @@ class RealtimeDiffusionPlannerService:
             }
         )
         return MotionPlanChunk(
-            qpos_36=plan.qpos_36,
+            qpos_36=plan.qpos,
             motion_features=plan.motion_features if self.config.include_motion_features else None,
             fps=plan.fps,
             request_id=str(request.request_id),
@@ -278,7 +292,9 @@ class RealtimeDiffusionPlannerService:
             "request_tracker_frame": request.tracker_frame,
             "buffer_remaining_frames": request.buffer_remaining_frames,
             "fps": response.fps,
-            "frames": int(response.qpos_36.shape[0]),
+            "frames": int(response.qpos.shape[0]),
+            "robot_name": response.robot_name,
+            "state_dim": response.state_dim,
             "planning_latency_seconds": response.planning_latency_seconds,
             "prompt": response.prompt,
             "timing_ms": response.metadata.get("timing_ms", {}),

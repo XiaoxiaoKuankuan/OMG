@@ -15,6 +15,8 @@ class RealtimeOrinBufferClientConfig:
     connect: str
     tracker_fps: float = 50.0
     request_timeout_ms: int = 30000
+    robot_name: str = "g1"
+    state_dim: int = 36
 
 
 class RealtimeOrinBufferClient:
@@ -27,7 +29,7 @@ class RealtimeOrinBufferClient:
 
     def __init__(self, config: RealtimeOrinBufferClientConfig) -> None:
         self.config = config
-        self.buffer = ReferenceMotionBuffer(target_fps=config.tracker_fps)
+        self.buffer = ReferenceMotionBuffer(target_fps=config.tracker_fps, state_dim=config.state_dim)
         self.transport = ZmqPlanClient(config.connect)
         self.last_plan_id: int | None = None
 
@@ -40,6 +42,9 @@ class RealtimeOrinBufferClient:
         prompt: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> MotionPlanChunk:
+        request_metadata = dict(metadata or {})
+        request_metadata.setdefault("robot_name", self.config.robot_name)
+        request_metadata.setdefault("state_dim", self.config.state_dim)
         request = RobotStateRequest(
             qpos_36_history=qpos_36_history,
             history_fps=history_fps,
@@ -47,7 +52,7 @@ class RealtimeOrinBufferClient:
             buffer_remaining_frames=self.buffer.remaining(int(tracker_frame)),
             last_plan_id=self.last_plan_id,
             prompt=prompt,
-            metadata=dict(metadata or {}),
+            metadata=request_metadata,
         )
         return self.transport.request_plan(request, timeout_ms=self.config.request_timeout_ms)
 
@@ -60,6 +65,9 @@ class RealtimeOrinBufferClient:
         prompt: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> RobotStateRequest:
+        request_metadata = dict(metadata or {})
+        request_metadata.setdefault("robot_name", self.config.robot_name)
+        request_metadata.setdefault("state_dim", self.config.state_dim)
         request = RobotStateRequest(
             qpos_36_history=qpos_36_history,
             history_fps=history_fps,
@@ -67,7 +75,7 @@ class RealtimeOrinBufferClient:
             buffer_remaining_frames=self.buffer.remaining(int(tracker_frame)),
             last_plan_id=self.last_plan_id,
             prompt=prompt,
-            metadata=dict(metadata or {}),
+            metadata=request_metadata,
         )
         self.transport.begin_request(request)
         return request

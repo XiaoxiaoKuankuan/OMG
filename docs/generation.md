@@ -116,6 +116,10 @@ dataset 模式。每次生成的 `metadata.json` 和 `reference_motion.npz` 都�
 - `async`：跟踪器持续执行参考缓冲区中的动作，扩散模型则在缓冲区耗尽前重新规划。
 - `offline-track`：生成一次参考动作，然后离线跟踪。
 
+`diffusion-only` 同时支持 G1 和 BUMI ONNX。`tracker-only`、`sync`、`async` 和
+`offline-track` 使用 HoloMotion G1 tracker，因此仍然只接受 G1；向这些模式传入 BUMI
+ONNX 会在启动阶段明确报错，不会把 BUMI 28D qpos 当成 G1 36D。
+
 ## 条件序列
 
 使用 `--condition-sequence` 指定片段级条件：
@@ -147,6 +151,19 @@ PYTHONPATH=src python -m omg.cli.pipeline.main \
 ```
 
 输出目录包含生成的参考动作和元数据。
+
+ONNX 流水线也支持不提供 seed 文件的默认姿态初始化：
+
+```bash
+--history-source default --target-fps 30
+```
+
+该路径直接调用 ONNX metadata 指向的 representation stats、kinematics 和 codec，生成
+`num_prev_states` 帧落地默认姿态，不加载训练数据集。原有 seed 行为继续使用：
+
+```bash
+--history-source seed --seed-motion /path/to/qpos.npz --seed-fps 30
+```
 
 ## 同步模式
 
@@ -229,6 +246,107 @@ PYTHONPATH=src python -m omg.cli.generation.export_onnx \
 
 导出器会验证训练去噪器与包装器之间，以及包装器与 ONNX 之间的数值一致性。
 任一检查超过容差时，它都会删除已生成的计算图并报错。
+
+### BUMI 100M 导出
+
+BUMI checkpoint 必须使用与训练完全相同的 full-data stats。不要使用仓库中用于开发的
+provisional stats：
+
+```bash
+cd /home/weili/OMG
+source .venv/bin/activate
+
+export CKPT=/home/weili/OMG_models/bumi_100m/sstep=200000.ckpt
+export STATS=/home/weili/OMG_models/bumi_93d_stats.json
+export T5=/home/weili/OMG_models/t5-base-local
+export ONNX=/home/weili/OMG_models/bumi_100m/onnx/denoiser_step.onnx
+
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/src:$PWD" \
+python -m omg.cli.generation.export_onnx \
+  --ckpt_path "$CKPT" \
+  --exp 100m_bumi \
+  --output "$ONNX" \
+  --device cuda \
+  --opset 18 \
+  --batch_size 2 \
+  representation.stats_path="$STATS" \
+  model.text_encoder.model_name="$T5"
+```
+
+导出 metadata v2 记录并在运行时验证：
+
+- `robot_name=bumi`、`state_dim=28`、21 个关节的确定顺序；
+- `representation_name=bumi_rot6d_93d`、`feat_dim=93`；
+- stats/kinematics 路径和 SHA256；
+- `sequence_length=60`、`num_prev_states=10`；
+- `quaternion_convention=wxyz`；
+- 文本、音频和 humanref 输入维度。
+
+移动模型时必须一起移动 `.onnx`、可能存在的 `.onnx.data` 和 `.onnx.meta.json`。
+
+### BUMI ONNX 文本生成
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/src:$PWD" \
+python -m omg.cli.pipeline.main \
+  --mode diffusion-only \
+  --diffusion-onnx "$ONNX" \
+  --history-source default \
+  --target-fps 30 \
+  --num-frames 120 \
+  --text "walk forward slowly" \
+  --cfg-text-scale 2.5 \
+  --providers CUDAExecutionProvider,CPUExecutionProvider \
+  --text-encoder-model "$T5" \
+  --representation-stats-path "$STATS" \
+  --torch-device cuda \
+  --no-compile-history-encoder \
+  --video \
+  --video-width 640 \
+  --video-height 480 \
+  --camera-view iso \
+  --follow-mode xy \
+  --output-root outputs_validation/bumi_onnx \
+  --output-name 100m_text
+```
+
+### BUMI ONNX 音乐生成
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/src:$PWD" \
+python -m omg.cli.pipeline.main \
+  --mode diffusion-only \
+  --diffusion-onnx "$ONNX" \
+  --history-source default \
+  --target-fps 30 \
+  --num-frames 300 \
+  --audio-wav /absolute/path/to/music.wav \
+  --audio-feature-type current35 \
+  --cfg-audio-scale 2.5 \
+  --providers CUDAExecutionProvider,CPUExecutionProvider \
+  --text-encoder-model "$T5" \
+  --representation-stats-path "$STATS" \
+  --torch-device cuda \
+  --no-compile-history-encoder \
+  --video \
+  --video-width 640 \
+  --video-height 480 \
+  --camera-view iso \
+  --follow-mode xy \
+  --output-root outputs_validation/bumi_onnx \
+  --output-name 100m_audio
+```
+
+BUMI 输出包含通用 `qpos.npy [T,28]` 和 `reference_motion.npz`，不会创建内容实际为
+28D 的伪 `qpos_36.npy`。G1 输出继续同时保留 `qpos.npy` 和兼容的 `qpos_36.npy`。
+
+ONNX metadata 中的 stats/kinematics 绝对路径若因跨机器部署而变化，可使用
+`--representation-stats-path` 和 `--kinematics-path` 指向新位置；运行时仍按导出时记录的
+SHA256 校验内容，错误版本不会被静默接受。
+
+Planner Server 可以根据协议 metadata 接收和返回 BUMI 28D qpos；现有
+`holomotion_dry_run`、`holomotion_real_bridge` 和 GMR bridge 是 G1 专用客户端，不能直接连接
+BUMI planner。BUMI 实机执行应由 BUMI controller bridge 使用通用协议的 `qpos` 字段。
 
 ## TensorRT 运行时
 

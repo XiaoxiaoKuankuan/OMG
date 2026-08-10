@@ -48,3 +48,18 @@ def test_executed_history_buffer_resamples_and_trims() -> None:
 
     with pytest.raises(RuntimeError, match="requires 6"):
         history.history(6)
+
+
+def test_bumi_motion_buffers_preserve_state_dim() -> None:
+    qpos = np.zeros((7, 28), dtype=np.float32)
+    qpos[:, 0] = np.arange(7, dtype=np.float32)
+    qpos[:, 2] = 0.55
+    qpos[:, 3] = 1.0
+
+    reference = ReferenceMotionBuffer(target_fps=50.0, state_dim=28)
+    reference.append_plan(plan_id=0, qpos_36=qpos, source_fps=50.0)
+    assert reference.qpos.shape == (7, 28)
+
+    history = ExecutedHistoryBuffer(target_fps=50.0, max_frames=5, state_dim=28)
+    history.append(qpos, fps=50.0)
+    assert history.qpos.shape == (5, 28)

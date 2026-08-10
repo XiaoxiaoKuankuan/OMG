@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from omg.pipeline import DEFAULT_TRACKER_ONNX_PROVIDERS_CSV, OnnxDiffusionPlanner
+from omg.pipeline.reference import load_motion_reference
 from omg.tracking.holomotion.io import load_reference_motion
 from omg.tracking.holomotion.reference import resample_qpos
 
@@ -52,7 +53,20 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mode", choices=["diffusion-only", "tracker-only", "sync", "async", "offline-track"], default="diffusion-only")
     parser.add_argument("--diffusion-onnx", default=None, help="Exported OMG denoiser step ONNX. Required unless --mode tracker-only.")
-    parser.add_argument("--seed-motion", required=True, help="Seed qpos_36 motion .npy/.npz/.pt used for history frames.")
+    parser.add_argument(
+        "--history-source",
+        choices=["seed", "default"],
+        default="seed",
+        help=(
+            "seed preserves the existing --seed-motion behavior; default initializes history from the "
+            "exported robot representation stats without loading a dataset or seed file."
+        ),
+    )
+    parser.add_argument(
+        "--seed-motion",
+        default=None,
+        help="Robot qpos motion .npy/.npz/.pt used for history frames when --history-source seed.",
+    )
     parser.add_argument("--seed-fps", type=float, default=None, help="FPS for seed .npy or override for seed file metadata.")
     parser.add_argument("--target-fps", type=float, default=None, help="Diffusion planning FPS. Defaults to seed FPS. Ignored by tracker-only.")
     parser.add_argument(
@@ -119,8 +133,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dit-cache-threshold", type=float, default=0.995)
     parser.add_argument("--dit-cache-warmup-steps", type=int, default=4)
     parser.add_argument("--dit-cache-max-consecutive", type=int, default=2)
-    parser.add_argument("--torch-device", default="auto", help="Device for T5 and G1 representation: auto, cpu, cuda.")
+    parser.add_argument("--torch-device", default="auto", help="Device for T5 and the robot representation: auto, cpu, cuda.")
     parser.add_argument("--text-encoder-model", default=None, help="Override text encoder model/path from ONNX metadata.")
+    parser.add_argument(
+        "--representation-stats-path",
+        default=None,
+        help="Override the representation stats location while preserving the SHA256 identity from ONNX metadata.",
+    )
+    parser.add_argument(
+        "--kinematics-path",
+        default=None,
+        help="Override the robot kinematics JSON location while preserving the SHA256 identity from ONNX metadata.",
+    )
     parser.add_argument(
         "--compile-history-encoder",
         action=argparse.BooleanOptionalAction,
@@ -187,9 +211,13 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    reference = load_reference_motion(args.seed_motion, fps=args.seed_fps)
     output_dir = Path(args.output_root) / _output_name(args)
     if args.mode == "tracker-only":
+        if args.seed_motion is None:
+            raise ValueError("--seed-motion is required when --mode tracker-only")
+        if args.history_source != "seed":
+            raise ValueError("--mode tracker-only requires --history-source seed")
+        reference = load_reference_motion(args.seed_motion, fps=args.seed_fps)
         _run_tracker_only(
             args,
             reference_qpos=reference.qpos_36,
@@ -200,10 +228,6 @@ def main() -> None:
 
     if args.diffusion_onnx is None:
         raise ValueError("--diffusion-onnx is required unless --mode tracker-only")
-    target_fps = float(reference.fps if args.target_fps is None else args.target_fps)
-    seed_qpos = reference.qpos_36
-    if target_fps != float(reference.fps):
-        seed_qpos = resample_qpos(seed_qpos, reference.fps, target_fps)
     if args.condition_sequence is not None:
         if args.text is not None:
             raise ValueError("--condition-sequence cannot be combined with --text")
@@ -216,6 +240,8 @@ def main() -> None:
         args.diffusion_onnx,
         providers=args.providers,
         text_encoder_model=args.text_encoder_model,
+        representation_stats_path=args.representation_stats_path,
+        kinematics_path=args.kinematics_path,
         torch_device=args.torch_device,
         seed=args.seed,
         tensorrt_fp16=_diffusion_tensorrt_fp16(args),
@@ -225,6 +251,39 @@ def main() -> None:
         dit_cache_warmup_steps=args.dit_cache_warmup_steps,
         dit_cache_max_consecutive=args.dit_cache_max_consecutive,
         compile_history_encoder=args.compile_history_encoder,
+    )
+    if args.mode in {"sync", "async", "offline-track"} and planner.robot_name != "g1":
+        raise ValueError(
+            f"--mode {args.mode} uses the G1-only HoloMotion tracker and cannot consume "
+            f"robot_name={planner.robot_name!r}; use --mode diffusion-only for BUMI ONNX"
+        )
+    if args.history_source == "default":
+        if args.seed_motion is not None:
+            raise ValueError("--seed-motion cannot be combined with --history-source default")
+        if args.seed_fps is not None:
+            raise ValueError("--seed-fps cannot be combined with --history-source default")
+        target_fps = 30.0 if args.target_fps is None else float(args.target_fps)
+        seed_qpos = planner.default_seed_qpos()
+        args.seed_motion_label = "representation_default_pose"
+    else:
+        if args.seed_motion is None:
+            raise ValueError("--seed-motion is required when --history-source seed")
+        reference = load_motion_reference(
+            args.seed_motion,
+            expected_state_dim=planner.state_dim,
+            fps=args.seed_fps,
+        )
+        target_fps = float(reference.fps if args.target_fps is None else args.target_fps)
+        seed_qpos = reference.qpos
+        if target_fps != float(reference.fps):
+            seed_qpos = resample_qpos(seed_qpos, reference.fps, target_fps)
+        args.seed_motion_label = str(reference.path)
+    if not np.isfinite(target_fps) or target_fps <= 0.0:
+        raise ValueError(f"--target-fps must be positive and finite, got {target_fps}")
+    print(
+        f"[INFO] ONNX robot={planner.robot_name} state_dim={planner.state_dim} "
+        f"feat_dim={planner.feat_dim} history_source={args.history_source}",
+        flush=True,
     )
     args.plan_text_prompts = ["" if args.text is None else str(args.text).strip()]
     text = args.plan_text_prompts[0]

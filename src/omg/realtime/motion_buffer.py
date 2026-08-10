@@ -9,10 +9,16 @@ from omg.realtime.protocol import QPOS_DIM
 from omg.tracking.holomotion.reference import resample_qpos
 
 
-def _coerce_qpos_36(value: Any, *, name: str, allow_empty: bool = False) -> np.ndarray:
+def _coerce_robot_qpos(
+    value: Any,
+    *,
+    name: str,
+    state_dim: int,
+    allow_empty: bool = False,
+) -> np.ndarray:
     qpos = np.asarray(value, dtype=np.float32)
-    if qpos.ndim != 2 or qpos.shape[1] != QPOS_DIM:
-        raise ValueError(f"{name} must have shape (T,{QPOS_DIM}), got {qpos.shape}")
+    if qpos.ndim != 2 or qpos.shape[1] != int(state_dim):
+        raise ValueError(f"{name} must have shape (T,{int(state_dim)}), got {qpos.shape}")
     if not allow_empty and qpos.shape[0] <= 0:
         raise ValueError(f"{name} is empty")
     if not np.isfinite(qpos).all():
@@ -52,10 +58,17 @@ class PlanSegment:
 
 
 class ReferenceMotionBuffer:
-    def __init__(self, *, target_fps: float) -> None:
+    def __init__(self, *, target_fps: float, state_dim: int = QPOS_DIM) -> None:
         self.target_fps = _coerce_fps(target_fps, name="target_fps")
-        self._qpos_36 = np.zeros((0, QPOS_DIM), dtype=np.float32)
+        self.state_dim = int(state_dim)
+        if self.state_dim < 8:
+            raise ValueError(f"state_dim must be at least 8, got {state_dim}")
+        self._qpos_36 = np.zeros((0, self.state_dim), dtype=np.float32)
         self._segments: list[PlanSegment] = []
+
+    @property
+    def qpos(self) -> np.ndarray:
+        return self._qpos_36
 
     @property
     def qpos_36(self) -> np.ndarray:
@@ -75,7 +88,7 @@ class ReferenceMotionBuffer:
         request_tracker_frame: int | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> PlanSegment:
-        qpos = _coerce_qpos_36(qpos_36, name="qpos_36")
+        qpos = _coerce_robot_qpos(qpos_36, name="qpos_36", state_dim=self.state_dim)
         source_fps = _coerce_fps(source_fps, name="source_fps")
         skip = int(skip_frames)
         if skip < 0:
@@ -154,12 +167,19 @@ class ReferenceMotionBuffer:
 
 
 class ExecutedHistoryBuffer:
-    def __init__(self, *, target_fps: float, max_frames: int) -> None:
+    def __init__(self, *, target_fps: float, max_frames: int, state_dim: int = QPOS_DIM) -> None:
         self.target_fps = _coerce_fps(target_fps, name="target_fps")
+        self.state_dim = int(state_dim)
+        if self.state_dim < 8:
+            raise ValueError(f"state_dim must be at least 8, got {state_dim}")
         self.max_frames = int(max_frames)
         if self.max_frames <= 0:
             raise ValueError(f"max_frames must be positive, got {max_frames}")
-        self._qpos_36 = np.zeros((0, QPOS_DIM), dtype=np.float32)
+        self._qpos_36 = np.zeros((0, self.state_dim), dtype=np.float32)
+
+    @property
+    def qpos(self) -> np.ndarray:
+        return self._qpos_36
 
     @property
     def qpos_36(self) -> np.ndarray:
@@ -170,7 +190,7 @@ class ExecutedHistoryBuffer:
         return int(self._qpos_36.shape[0])
 
     def append(self, qpos_36: np.ndarray, *, fps: float) -> None:
-        qpos = _coerce_qpos_36(qpos_36, name="qpos_36")
+        qpos = _coerce_robot_qpos(qpos_36, name="qpos_36", state_dim=self.state_dim)
         resampled = resample_qpos(qpos, source_fps=_coerce_fps(fps, name="fps"), target_fps=self.target_fps)
         updated = np.concatenate([self._qpos_36, resampled.astype(np.float32, copy=False)], axis=0)
         self._qpos_36 = updated[-self.max_frames :].astype(np.float32, copy=False)
