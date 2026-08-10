@@ -6,7 +6,109 @@
 PYTHONPATH=src python -m omg.cli.pipeline.main
 ```
 
-它支持五种模式：
+## PyTorch checkpoint 推理的历史来源
+
+`omg.cli.generation.generate` 支持两种明确的历史初始化方式。
+
+### Standalone deployment（推荐）
+
+`--history_source default` 是默认模式。它不会实例化 Hydra 数据配置，也不会读取
+LeRobotDataset 或 materialized cache。初始历史由机器人表示直接构造：
+
+1. `representation.get_default_prev_qpos()` 从匹配的 stats JSON 读取默认根姿态和关节姿态；
+2. representation 已有的 grounding 逻辑保证默认足底落地；
+3. 已有 FK 计算默认姿态的 body position/quaternion；
+4. `codec.prev_state_features_from_history()` 生成与训练完全相同的历史特征和 canonical root。
+
+因此 standalone 推理不需要 OMG-Data、BUMI LeRobotDataset、materialized cache 或 Dev32。
+它仍然需要：
+
+- OMG 代码、机器人 MJCF 和 kinematics；
+- checkpoint；
+- 与训练完全匹配的 stats JSON；
+- 本地 T5（使用文本条件时）；
+- 可选 WAV 或 humanref 文件。
+
+stats 是训练/推理坐标系的一部分，不能省略或用其他数据集的 stats 替代。建议同时通过
+环境变量和 Hydra override 明确指定：
+
+```bash
+export OMG_BUMI_STATS_PATH=/path/to/bumi_93d_stats.json
+
+PYTHONPATH="$PWD/src:$PWD" python -m omg.cli.generation.generate \
+  --ckpt_path /path/to/sstep=200000.ckpt \
+  --exp 300m_bumi \
+  --history_source default \
+  --text "walk forward slowly and then stop" \
+  --num_frames 180 \
+  --seed 0 \
+  --cfg_text_scale 2.5 \
+  --render_video \
+  --width 640 \
+  --height 480 \
+  --camera_view iso \
+  --follow_mode xy \
+  representation.stats_path="$OMG_BUMI_STATS_PATH" \
+  model.text_encoder.model_name=/path/to/t5-base-local
+```
+
+纯音乐 standalone 推理：
+
+```bash
+PYTHONPATH="$PWD/src:$PWD" python -m omg.cli.generation.generate \
+  --ckpt_path /path/to/sstep=200000.ckpt \
+  --exp 300m_bumi \
+  --history_source default \
+  --music /path/to/test.wav \
+  --music_mod raw \
+  --music_feature_type current35 \
+  --num_frames 300 \
+  --seed 0 \
+  --cfg_audio_scale 2.5 \
+  --render_video \
+  --width 640 \
+  --height 480 \
+  --camera_view iso \
+  --follow_mode xy \
+  representation.stats_path="$OMG_BUMI_STATS_PATH" \
+  model.text_encoder.model_name=/path/to/t5-base-local
+```
+
+standalone 模式没有显式文本时使用 null text；音频或 humanref 没有提供时也使用对应的
+null condition，不会为了补条件而加载数据集。外部 WAV、feature 和 humanref 都从第0帧开始。
+
+### Dataset-backed debug/evaluation
+
+`--history_source dataset` 保留原有行为：从 validation dataset 的
+`--history_val_index` 取得历史，并允许使用数据集 caption、对齐音频和 humanref。该模式用于：
+
+- GT comparison；
+- dataset-aligned benchmark/debug；
+- 重现旧 generation 历史；
+- `--save_gt_motion`、`--render_comparison_video`、`--aligned_gt_comparison`。
+
+示例：
+
+```bash
+PYTHONPATH="$PWD/src:$PWD" python -m omg.cli.generation.generate \
+  --ckpt_path /path/to/sstep=200000.ckpt \
+  --exp 300m_bumi \
+  --history_source dataset \
+  --history_val_index 0 \
+  --text "walk forward" \
+  --num_frames 120 \
+  --save_gt_motion \
+  --render_comparison_video \
+  representation.stats_path="$OMG_BUMI_STATS_PATH" \
+  model.text_encoder.model_name=/path/to/t5-base-local \
+  data=omg_bumi_lerobot_omnimodal
+```
+
+在 `--history_source default` 下使用任何 GT comparison 参数会立即报错，不会隐式切换到
+dataset 模式。每次生成的 `metadata.json` 和 `reference_motion.npz` 都记录
+`history_source`、stats绝对路径及 SHA-256。
+
+离线流水线入口支持五种模式：
 
 - `diffusion-only`：生成参考动作，并可选择渲染。
 - `tracker-only`：通过 HoloMotion 跟踪已有参考动作。

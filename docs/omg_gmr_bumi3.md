@@ -15,7 +15,7 @@ omg_gmr_bridge
       ↓ 固定 50 Hz，Redis JSON: omg_online_frame_g1
 GMR G1MotionReader + G1MotionAdapter
       ↓ G1 MuJoCo FK，12 个 BodyMap 目标
-现有 GMR IK
+GMR IK + G1→BUMI3 支撑脚足底约束
       ↓
 BUMI3 MuJoCo Viewer
       ↓ 可选 Redis binary: gmt_online_frame_bumi
@@ -215,6 +215,9 @@ export BUMI3_REDIS_KEY=gmt_online_frame_bumi
   --hz 50 \
   --ttl-ms 200 \
   --stale-ms 250 \
+  --foot-contact-constraints \
+  --foot-contact-weight-scale 0.25 \
+  --reference-interpolation \
   --viewer-ground-penetration 0.005 \
   --viewer-width 1280 \
   --viewer-height 720 \
@@ -222,16 +225,33 @@ export BUMI3_REDIS_KEY=gmt_online_frame_bumi
   --vis-targets
 ```
 
-这个命令不改动原 GMR IK：
+gait-aware 重定向只在显式传入 `--foot-contact-constraints` 时启用；不传该参数
+就是修改前的 full-pose IK、每帧最低足点 ground-align 和 sample-and-hold 路径。
+原 GEM/SMPL-X 配置和 server 始终走原逻辑：
 
 - BUMI3 完整模型显示在 GMR MuJoCo 窗口；
 - `--vis-targets` 叠加 G1 FK 原始目标、缩放目标和 BUMI3 body skeleton；
 - 默认同时向 `gmt_online_frame_bumi` 发布 BUMI3 GMT 格式。
-- GMR 输出仍按每帧最低脚部几何严格贴地；
-  `--viewer-ground-penetration 0.005` 只把 MuJoCo viewer 使用的 qpos 副本下移
-  5 mm，减轻网格看起来悬空的缝隙，不改变发给 GMT 的根位姿和关节。设为 `0`
-  可关闭；若仍有脚跟翘起，原因是脚掌姿态而不是根高度，需要另行增加足底姿态/
-  接触约束。
+- BUMI3 实体 waist 关节只跟踪 G1 torso yaw；torso roll 丢弃并由 root roll-upright
+  抑制左右倾斜。torso pitch 则单独映射到浮动躯干前倾，由髋、膝、踝在足部位置
+  任务下配合实现，因此弯腰和鞠躬不会被 upright 目标抹掉。
+- root XY/yaw 与 Z 分离；根据足底高度、垂直速度和水平速度检测可靠支撑脚；
+  双支撑保持上一只主脚，root Z 由主支撑脚与 BUMI3 腿部 FK 计算，而不是每帧
+  用左右脚全局最低点重新对齐。摆动脚只保留防穿地安全检查。
+- 对非 free-root 关节增加轻量速度/加速度连续项，不增强足底锁定。
+- 动态双支撑只选一只主脚，XY 使用带 8 mm 死区的软锚点。低空但正在移动的脚立即释放；两脚都不可靠时
+  只让较低脚以低权重柔性贴地，不锁 XY，
+  因此舞蹈抬脚和转身不会再像粘在地面。
+- 默认只把真实足部 mesh 防穿透作为硬约束；平足、中心高度和防滑均为软目标，
+  8 帧渐入。root Z 由持续的主支撑脚 FK 决定，不再逐次投影 root XY，也不再让
+  左右脚全局最低点轮流决定根高度。
+- `--reference-interpolation` 对 viewer 和 GMT 参考 qpos 做约一个输入帧的因果
+  插值，消除 30/50 Hz sample-and-hold 卡顿；`--no-reference-interpolation`
+  可以关闭，原兼容模式默认不启用。
+- `--viewer-ground-penetration 0.005` 仍只把 MuJoCo viewer 使用的 qpos 副本下移
+  5 mm，不改变发给 GMT 的根位姿和关节。设为 `0` 可关闭。
+- 不传新参数，或显式使用 `--no-foot-contact-constraints`，都可恢复此前的 IK +
+  每帧 ground-align，用于 A/B 对比。
 
 如果只看重定向、不发布给 GMT，增加：
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -493,6 +494,239 @@ def _history_batch(dataset, history_val_index: int | None) -> dict:
     return motion_collate_fn([dataset[index]])
 
 
+def _model_device_dtype(model) -> tuple[torch.device, torch.dtype]:
+    parameter = next(model.parameters(), None)
+    if parameter is not None:
+        return parameter.device, parameter.dtype
+    buffer = next(model.buffers(), None)
+    if buffer is not None:
+        return buffer.device, buffer.dtype
+    return torch.device("cpu"), torch.float32
+
+
+def _default_history_batch(model, *, fps: float, num_frames: int) -> dict:
+    """Build deployment history from the representation's grounded default pose."""
+
+    representation = model.representation
+    device, dtype = _model_device_dtype(model)
+    batch_size = 1
+    num_prev_states = int(representation.num_prev_states)
+    state_dim = int(representation.state_dim)
+    feature_dim = int(representation.feat_dim)
+    num_frames = int(num_frames)
+    if num_frames <= 0:
+        raise ValueError(f"num_frames must be positive, got {num_frames}")
+
+    prev_qpos = representation.get_default_prev_qpos(
+        batch_size=batch_size,
+        device=device,
+        dtype=dtype,
+    )
+    expected_qpos_shape = (batch_size, num_prev_states, state_dim)
+    if tuple(prev_qpos.shape) != expected_qpos_shape:
+        raise ValueError(
+            "Default history qpos shape mismatch: "
+            f"expected={expected_qpos_shape}, actual={tuple(prev_qpos.shape)}"
+        )
+    if not torch.isfinite(prev_qpos).all():
+        raise ValueError("Default history qpos contains non-finite values")
+
+    fk = representation.kinematics.forward_kinematics(prev_qpos)
+    prev_state_features, canon_root_pos, canon_root_quat = (
+        representation.codec.prev_state_features_from_history(
+            prev_qpos,
+            fk["body_pos_w"],
+            fk["body_quat_w"],
+            fps=torch.full((batch_size,), float(fps), device=device, dtype=dtype),
+        )
+    )
+    expected_feature_shape = (batch_size, num_prev_states, feature_dim)
+    if tuple(prev_state_features.shape) != expected_feature_shape:
+        raise ValueError(
+            "Default history feature shape mismatch: "
+            f"expected={expected_feature_shape}, actual={tuple(prev_state_features.shape)}"
+        )
+    if not all(
+        torch.isfinite(value).all()
+        for value in (prev_state_features, canon_root_pos, canon_root_quat)
+    ):
+        raise ValueError("Default history features or canonical root contain non-finite values")
+
+    return {
+        "B": batch_size,
+        "history_features": prev_state_features,
+        "prev_state_features": prev_state_features,
+        "canon_root_pos": canon_root_pos,
+        "canon_root_quat": canon_root_quat,
+        "fps": torch.full((batch_size,), float(fps), device=device, dtype=dtype),
+        "caption": [""],
+        "has_text": torch.zeros(batch_size, dtype=torch.bool, device=device),
+        "mask": {
+            "valid": torch.ones(batch_size, num_frames, dtype=torch.bool, device=device),
+        },
+    }
+
+
+def _initialize_history(model, cfg, args: argparse.Namespace, *, num_frames: int):
+    history_source = str(args.history_source)
+    if history_source == "default":
+        batch = _default_history_batch(model, fps=float(args.fps), num_frames=num_frames)
+        return None, batch, {}, None
+    if history_source != "dataset":
+        raise ValueError(f"Unsupported history_source={history_source!r}")
+
+    dataset = _val_dataset(cfg, num_frames=num_frames)
+    history_val_index = int(args.history_val_index)
+    batch = _history_batch(dataset, history_val_index)
+    history_meta = _jsonable_meta(_first_meta(batch))
+    return dataset, batch, history_meta, history_val_index
+
+
+def _validate_history_source_args(args: argparse.Namespace) -> None:
+    if str(args.history_source) != "default":
+        return
+    dataset_only_flags = (
+        ("aligned_gt_comparison", "--aligned_gt_comparison"),
+        ("save_gt_motion", "--save_gt_motion"),
+        ("render_comparison_video", "--render_comparison_video"),
+        ("overlay_gt_on_generated", "--overlay_gt_on_generated"),
+    )
+    for attribute, flag in dataset_only_flags:
+        if bool(getattr(args, attribute, False)):
+            raise ValueError(f"{flag} requires --history_source dataset")
+
+
+def _representation_stats_info(model) -> dict[str, str]:
+    representation = model.representation
+    stats_path = Path(representation.stats_path).expanduser().resolve()
+    if not stats_path.is_file():
+        raise FileNotFoundError(f"Robot representation stats file does not exist: {stats_path}")
+    payload = json.loads(stats_path.read_text(encoding="utf-8"))
+    expected_optional_fields = {
+        "feature_dim": int(representation.feat_dim),
+        "robot_name": str(representation.robot_name),
+        "state_dim": int(representation.state_dim),
+    }
+    for field, expected in expected_optional_fields.items():
+        if field in payload and payload[field] != expected:
+            raise ValueError(
+                f"Representation stats {field} mismatch: path={stats_path} "
+                f"expected={expected!r} actual={payload[field]!r}"
+            )
+    stats_rotation = payload.get("rotation_representation")
+    if stats_rotation is not None:
+        normalized_rotation = representation.codec._normalize_rotation_representation(stats_rotation)
+        if normalized_rotation != representation.rotation_representation:
+            raise ValueError(
+                "Representation stats rotation_representation mismatch: "
+                f"path={stats_path} expected={representation.rotation_representation!r} "
+                f"actual={stats_rotation!r}"
+            )
+    digest = hashlib.sha256(stats_path.read_bytes()).hexdigest()
+    print(f"[INFO] Robot representation stats: {stats_path}")
+    print(f"[INFO] Stats SHA256: {digest}")
+    return {"stats_path": str(stats_path), "stats_sha256": digest}
+
+
+def _prepare_condition_batch(
+    args: argparse.Namespace,
+    cfg,
+    *,
+    batch: dict,
+    dataset,
+    history_meta: dict,
+    text: str,
+    num_frames: int,
+) -> dict:
+    history_source = str(args.history_source)
+    dataset_backed = history_source == "dataset"
+    if dataset_backed and args.text is None and args.text_file is None:
+        captions = batch.get("caption")
+        text = str(captions[0]) if isinstance(captions, list) and captions else ""
+
+    use_audio = bool(cfg.model.get("use_audio", False))
+    music_start_frame = int(history_meta.get("window_start", 0)) if dataset_backed and use_audio else 0
+    condition_start_frame = (
+        int(history_meta.get("window_start", 0))
+        if dataset_backed and args.human_motion is None
+        else 0
+    )
+
+    if args.disable_audio_condition and use_audio:
+        audio_dim = int(cfg.model.get("audio_dim", 35))
+        music_features = torch.zeros(num_frames, audio_dim, dtype=torch.float32)
+        has_audio = torch.zeros(num_frames, dtype=torch.bool)
+        music_end_frame = None
+        music_path = None
+    elif args.music is not None:
+        music_features, has_audio, music_end_frame, music_path = _load_music(
+            args,
+            cfg,
+            start_frame=music_start_frame,
+            num_frames=num_frames,
+        )
+    elif dataset_backed and use_audio:
+        dataset_audio = batch.get("audio_features")
+        dataset_audio_mask = batch.get("mask", {}).get("has_audio")
+        if not torch.is_tensor(dataset_audio) or not torch.is_tensor(dataset_audio_mask):
+            raise ValueError("LeRobot validation sample does not expose aligned audio features and mask")
+        music_features = dataset_audio[0]
+        has_audio = dataset_audio_mask[0]
+        music_end_frame = None
+        music_path = str(history_meta.get("source_file", ""))
+    else:
+        music_features = None
+        has_audio = None
+        music_end_frame = None
+        music_path = None
+
+    if args.human_motion is None and dataset_backed and bool(cfg.model.get("use_human_motion", False)):
+        dataset_human = batch.get("human_motion")
+        dataset_human_mask = batch.get("mask", {}).get("has_human_motion")
+        if not torch.is_tensor(dataset_human) or not torch.is_tensor(dataset_human_mask):
+            raise ValueError("LeRobot validation sample does not expose aligned human-reference features and mask")
+        human_motion = dataset_human[0]
+        has_human_motion = dataset_human_mask[0]
+        human_motion_end_frame = None
+        human_motion_path = str(history_meta.get("source_file", ""))
+    else:
+        human_motion, has_human_motion, human_motion_end_frame, human_motion_path = _load_human_motion(
+            args,
+            cfg,
+            dataset,
+            history_meta,
+            start_frame=condition_start_frame,
+            num_frames=num_frames,
+        )
+    if args.disable_human_motion_condition and bool(cfg.model.get("use_human_motion", False)):
+        human_motion_dim = int(cfg.model.get("human_motion_dim", 66))
+        human_motion = torch.zeros(num_frames, human_motion_dim, dtype=torch.float32)
+        has_human_motion = torch.zeros(num_frames, dtype=torch.bool)
+        human_motion_end_frame = None
+        human_motion_path = None
+
+    batch["caption"] = [text]
+    batch["has_text"] = torch.tensor([text != ""], dtype=torch.bool)
+    if music_features is not None:
+        _attach_music(batch, music_features, has_audio)
+    if human_motion is not None:
+        _attach_human_motion(batch, human_motion, has_human_motion)
+
+    return {
+        "batch": batch,
+        "text": text,
+        "music_start_frame": music_start_frame,
+        "music_features": music_features,
+        "has_audio": has_audio,
+        "music_end_frame": music_end_frame,
+        "music_path": music_path,
+        "human_motion": human_motion,
+        "has_human_motion": has_human_motion,
+        "human_motion_end_frame": human_motion_end_frame,
+        "human_motion_path": human_motion_path,
+    }
+
+
 def _first_meta(batch: dict) -> dict:
     meta = batch.get("meta")
     if isinstance(meta, list) and meta:
@@ -574,6 +808,15 @@ def _parse_args() -> argparse.Namespace:
     text_group = parser.add_mutually_exclusive_group(required=False)
     text_group.add_argument("--text")
     text_group.add_argument("--text_file")
+    parser.add_argument(
+        "--history_source",
+        choices=["default", "dataset"],
+        default="default",
+        help=(
+            "History initialization source. 'default' uses the representation's grounded default pose "
+            "without loading a dataset; 'dataset' preserves validation-history replay behavior."
+        ),
+    )
     parser.add_argument("--history_val_index", type=int, default=130)
     parser.add_argument("--cfg_scale", type=float, default=None)
     parser.add_argument("--cfg_text_scale", type=float, default=None)
@@ -592,8 +835,8 @@ def _parse_args() -> argparse.Namespace:
         "--music",
         default=None,
         help="Optional override: .npy (T,D) features or .wav with --music_mod raw. "
-        "If omitted and model.use_audio is true, audio_features are loaded from the val dataset (same as training). "
-        "External .npy is sliced from window_start of --history_val_index; dataset audio uses the same window.",
+        "With --history_source default, omission means null audio. With --history_source dataset, omission "
+        "loads aligned validation audio. External conditions start at frame zero in standalone mode.",
     )
     parser.add_argument("--music_mod", choices=["feature", "raw"], default="feature")
     parser.add_argument("--music_feature_type", choices=["current35", "aistpp_librosa35"], default="current35")
@@ -649,6 +892,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    _validate_history_source_args(args)
     if args.aligned_gt_comparison:
         args.save_gt_motion = True
         args.render_comparison_video = True
@@ -673,72 +917,38 @@ def main() -> None:
     print(f"[INFO] Checkpoint path: {Path(args.ckpt_path).resolve()}")
     model = _load_model(cfg, args.ckpt_path)
     print(_condition_injection_banner(getattr(model, "frame_cond_injection", None), "loaded model"))
+    stats_info = _representation_stats_info(model)
     requested_num_frames = int(args.num_frames)
     sample_num_frames = _round_up_frames(requested_num_frames, int(model.representation.sequence_length))
-    dataset = _val_dataset(cfg, num_frames=sample_num_frames)
-    history_val_index = int(args.history_val_index)
-    batch = _history_batch(dataset, history_val_index)
-    history_meta = _jsonable_meta(_first_meta(batch))
-    print(history_meta)
-    if args.text is None and args.text_file is None:
-        captions = batch.get("caption")
-        text = str(captions[0]) if isinstance(captions, list) and captions else ""
-    use_audio = bool(cfg.model.get("use_audio", False))
-    music_start_frame = int(history_meta.get("window_start", 0)) if use_audio else 0
-    condition_start_frame = 0 if args.human_motion is not None else int(history_meta.get("window_start", 0))
-    if args.disable_audio_condition and bool(cfg.model.get("use_audio", False)):
-        audio_dim = int(cfg.model.get("audio_dim", 35))
-        music_features = torch.zeros(sample_num_frames, audio_dim, dtype=torch.float32)
-        has_audio = torch.zeros(sample_num_frames, dtype=torch.bool)
-        music_end_frame = None
-        music_path = None
-    else:
-        if args.music is None and bool(cfg.model.get("use_audio", False)):
-            dataset_audio = batch.get("audio_features")
-            dataset_audio_mask = batch.get("mask", {}).get("has_audio")
-            if not torch.is_tensor(dataset_audio) or not torch.is_tensor(dataset_audio_mask):
-                raise ValueError("LeRobot validation sample does not expose aligned audio features and mask")
-            music_features = dataset_audio[0]
-            has_audio = dataset_audio_mask[0]
-            music_end_frame = None
-            music_path = str(history_meta.get("source_file", ""))
-        else:
-            music_features, has_audio, music_end_frame, music_path = _load_music(
-                args,
-                cfg,
-                start_frame=music_start_frame,
-                num_frames=sample_num_frames,
-            )
-    if args.human_motion is None and bool(cfg.model.get("use_human_motion", False)):
-        dataset_human = batch.get("human_motion")
-        dataset_human_mask = batch.get("mask", {}).get("has_human_motion")
-        if not torch.is_tensor(dataset_human) or not torch.is_tensor(dataset_human_mask):
-            raise ValueError("LeRobot validation sample does not expose aligned human-reference features and mask")
-        human_motion = dataset_human[0]
-        has_human_motion = dataset_human_mask[0]
-        human_motion_end_frame = None
-        human_motion_path = str(history_meta.get("source_file", ""))
-    else:
-        human_motion, has_human_motion, human_motion_end_frame, human_motion_path = _load_human_motion(
-            args,
-            cfg,
-            dataset,
-            history_meta,
-            start_frame=condition_start_frame,
-            num_frames=sample_num_frames,
-        )
-    if args.disable_human_motion_condition and bool(cfg.model.get("use_human_motion", False)):
-        human_motion_dim = int(cfg.model.get("human_motion_dim", 66))
-        human_motion = torch.zeros(sample_num_frames, human_motion_dim, dtype=torch.float32)
-        has_human_motion = torch.zeros(sample_num_frames, dtype=torch.bool)
-        human_motion_end_frame = None
-        human_motion_path = None
-    batch["caption"] = [text]
-    batch["has_text"] = torch.tensor([text != ""], dtype=torch.bool)
-    if music_features is not None:
-        _attach_music(batch, music_features, has_audio)
-    if human_motion is not None:
-        _attach_human_motion(batch, human_motion, has_human_motion)
+    dataset, batch, history_meta, history_val_index = _initialize_history(
+        model,
+        cfg,
+        args,
+        num_frames=sample_num_frames,
+    )
+    print(f"[INFO] History source: {args.history_source}")
+    if history_meta:
+        print(history_meta)
+    prepared = _prepare_condition_batch(
+        args,
+        cfg,
+        batch=batch,
+        dataset=dataset,
+        history_meta=history_meta,
+        text=text,
+        num_frames=sample_num_frames,
+    )
+    batch = prepared["batch"]
+    text = prepared["text"]
+    music_start_frame = prepared["music_start_frame"]
+    music_features = prepared["music_features"]
+    has_audio = prepared["has_audio"]
+    music_end_frame = prepared["music_end_frame"]
+    music_path = prepared["music_path"]
+    human_motion = prepared["human_motion"]
+    has_human_motion = prepared["has_human_motion"]
+    human_motion_end_frame = prepared["human_motion_end_frame"]
+    human_motion_path = prepared["human_motion_path"]
 
     active_modalities = []
     if text != "" and cfg.model.get("text_encoder") is not None:
@@ -766,6 +976,15 @@ def main() -> None:
     robot_name = str(model.representation.robot_name)
     state_dim = int(model.representation.state_dim)
     joint_names = list(model.representation.joint_names)
+    initialization = {
+        "type": "representation_default_pose" if args.history_source == "default" else "dataset_history",
+        "num_prev_states": int(model.representation.num_prev_states),
+        "canonical_frame_idx": int(model.representation.canonical_frame_idx),
+        "stats_path": stats_info["stats_path"],
+        "stats_sha256": stats_info["stats_sha256"],
+        "robot_name": robot_name,
+        "state_dim": state_dim,
+    }
     qpos = sample["qpos"].detach().cpu()[:, :requested_num_frames]
     if qpos.shape[-1] != state_dim:
         raise ValueError(f"Generated qpos has shape {tuple(qpos.shape)}, expected state_dim={state_dim}")
@@ -842,7 +1061,16 @@ def main() -> None:
         text=np.asarray([text], dtype=np.str_),
         exp=np.asarray([str(args.exp)], dtype=np.str_),
         ckpt_path=np.asarray([str(Path(args.ckpt_path).resolve())], dtype=np.str_),
-        history_val_index=np.asarray([history_val_index], dtype=np.int32),
+        history_source=np.asarray([str(args.history_source)], dtype=np.str_),
+        initialization_type=np.asarray([initialization["type"]], dtype=np.str_),
+        num_prev_states=np.asarray([initialization["num_prev_states"]], dtype=np.int32),
+        canonical_frame_idx=np.asarray([initialization["canonical_frame_idx"]], dtype=np.int32),
+        stats_path=np.asarray([stats_info["stats_path"]], dtype=np.str_),
+        stats_sha256=np.asarray([stats_info["stats_sha256"]], dtype=np.str_),
+        history_val_index=np.asarray(
+            [] if history_val_index is None else [history_val_index],
+            dtype=np.int32,
+        ),
         window_start=np.asarray([int(history_meta.get("window_start", 0))], dtype=np.int32),
         source_file=np.asarray([str(history_meta.get("source_file", ""))], dtype=np.str_),
         music_path=np.asarray([] if music_path is None else [music_path], dtype=np.str_),
@@ -1008,7 +1236,11 @@ def main() -> None:
         "sample_num_frames": int(sample_num_frames),
         "seed": int(args.seed),
         "text": text,
+        "history_source": str(args.history_source),
         "history_val_index": history_val_index,
+        "initialization": initialization,
+        "stats_path": stats_info["stats_path"],
+        "stats_sha256": stats_info["stats_sha256"],
         "aligned_gt_comparison": bool(args.aligned_gt_comparison),
         "overlay_gt_on_generated": bool(args.overlay_gt_on_generated),
         "overlay_gt_alpha": float(args.overlay_gt_alpha),
