@@ -9,6 +9,7 @@ from scipy.io import wavfile
 
 from omg.realtime.dynamic_condition import (
     DynamicConditionController,
+    analyze_wav_timing,
     compute_condition_audio_step_frames,
 )
 
@@ -142,6 +143,9 @@ def test_audio_duration_start_and_end_switch_to_stand(tmp_path: Path) -> None:
         "command_id": "music",
         "audio_path": str(path.resolve()),
         "duration_seconds": 2.0,
+        "source_duration_seconds": 2.0,
+        "effective_duration_seconds": 2.0,
+        "trimmed_trailing_silence_seconds": 0.0,
         "tracker_frame": 117,
         "next_condition": "text: stand still",
     }
@@ -150,6 +154,59 @@ def test_audio_duration_start_and_end_switch_to_stand(tmp_path: Path) -> None:
     assert ended.condition_session_id != started.condition_session_id
     assert ended.condition_index == 0
     assert ended.revision == started.revision + 1
+
+
+def test_continuous_wav_silent_tail_sets_effective_duration(tmp_path: Path) -> None:
+    sample_rate = 1000
+    waveform = np.concatenate(
+        (
+            np.full((2000,), 12000, dtype=np.int16),
+            np.zeros((2000,), dtype=np.int16),
+        )
+    )
+    path = tmp_path / "audible-then-silent.wav"
+    wavfile.write(path, sample_rate, waveform)
+
+    timing = analyze_wav_timing(
+        str(path),
+        silence_threshold_dbfs=-50.0,
+        minimum_trailing_silence_seconds=0.5,
+        analysis_window_seconds=0.02,
+    )
+    assert timing.source_duration_seconds == pytest.approx(4.0)
+    assert timing.effective_duration_seconds == pytest.approx(2.0)
+    assert timing.trailing_silence_seconds == pytest.approx(2.0)
+    assert timing.has_audible_content is True
+
+    controller = DynamicConditionController(tracker_fps=50.0)
+    controller.accept_audio(str(path), command_id="trimmed")
+    snapshot = controller.snapshot_for_replan(current_tracker_frame=10)
+    assert snapshot.audio_duration_seconds == pytest.approx(2.0)
+    assert snapshot.audio_source_duration_seconds == pytest.approx(4.0)
+    assert snapshot.audio_effective_duration_seconds == pytest.approx(2.0)
+    assert snapshot.audio_trailing_silence_seconds == pytest.approx(2.0)
+    assert snapshot.audio_end_tracker_frame == 110
+
+
+def test_short_silent_tail_is_not_trimmed(tmp_path: Path) -> None:
+    sample_rate = 1000
+    waveform = np.concatenate(
+        (
+            np.full((1000,), 12000, dtype=np.int16),
+            np.zeros((400,), dtype=np.int16),
+        )
+    )
+    path = tmp_path / "short-tail.wav"
+    wavfile.write(path, sample_rate, waveform)
+
+    timing = analyze_wav_timing(
+        str(path),
+        minimum_trailing_silence_seconds=0.5,
+        analysis_window_seconds=0.02,
+    )
+    assert timing.source_duration_seconds == pytest.approx(1.4)
+    assert timing.effective_duration_seconds == pytest.approx(1.4)
+    assert timing.trailing_silence_seconds == pytest.approx(0.0)
 
 
 def test_audio_replaced_by_text_cannot_later_trigger_old_end(tmp_path: Path) -> None:

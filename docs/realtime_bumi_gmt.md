@@ -141,7 +141,10 @@ quit
 音乐动作发布后等待 GMT 确认：GMT 成功读取并校验该 `sequence` 后写入独立的
 `gmt_online_frame_bumi_ack` key，OMG 收到同一 stream/revision/sequence 的 ACK
 才启动 ffplay 和音乐执行时钟。diffusion 推理耗时不计入音乐时间轴；自然结束
-后平滑回固定站立。新文本、`stand` 或新音乐会终止旧 ffplay 进程。
+后平滑回固定站立。Bridge 默认用 20 ms RMS 窗检测低于 -50 dBFS、连续至少
+0.5 秒的尾部静音；检测出的静音尾巴不计入有效音乐时长。到有效结束帧时会同时
+停止 ffplay、丢弃尚未执行的音乐计划并开始平滑回站。新文本、`stand` 或新音乐
+会终止旧 ffplay 进程。
 
 ## trajectory_v1
 

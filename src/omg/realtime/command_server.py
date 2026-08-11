@@ -116,6 +116,15 @@ class DynamicCommandServer:
             "command_revision": int(command.revision),
             "condition_session_id": active["condition_session_id"],
             "audio_duration_seconds": active["audio_duration_seconds"],
+            "audio_source_duration_seconds": active[
+                "audio_source_duration_seconds"
+            ],
+            "audio_effective_duration_seconds": active[
+                "audio_effective_duration_seconds"
+            ],
+            "audio_trailing_silence_seconds": active[
+                "audio_trailing_silence_seconds"
+            ],
             "audio_start_tracker_frame": active["audio_start_tracker_frame"],
             "audio_end_tracker_frame": active["audio_end_tracker_frame"],
             "stale_command": self.controller.last_requested_revision != command.revision,

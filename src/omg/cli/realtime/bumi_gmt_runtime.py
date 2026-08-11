@@ -75,6 +75,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--history-frames", type=_positive_int, default=10)
     parser.add_argument("--planner-frames", type=_positive_int, default=60)
     parser.add_argument("--replan-remaining-frames", type=int, default=60)
+    parser.add_argument(
+        "--audio-tail-silence-dbfs", type=float, default=-50.0
+    )
+    parser.add_argument(
+        "--audio-tail-silence-min-seconds", type=float, default=0.5
+    )
+    parser.add_argument(
+        "--audio-tail-analysis-window-ms", type=float, default=20.0
+    )
     parser.add_argument("--condition-audio-step-frames", type=int, default=None)
     parser.add_argument("--play-audio", action="store_true")
     parser.add_argument("--ffplay", default="/usr/bin/ffplay")
@@ -154,6 +163,12 @@ def _bridge_command(args: argparse.Namespace, connect: str) -> list[str]:
         str(args.planner_frames),
         "--replan-remaining-frames",
         str(args.replan_remaining_frames),
+        "--audio-tail-silence-dbfs",
+        str(args.audio_tail_silence_dbfs),
+        "--audio-tail-silence-min-seconds",
+        str(args.audio_tail_silence_min_seconds),
+        "--audio-tail-analysis-window-ms",
+        str(args.audio_tail_analysis_window_ms),
         "--redis-host",
         str(args.redis_host),
         "--redis-port",

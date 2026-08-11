@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 from scipy.io import wavfile
 
 from omg.cli.realtime.omg_bumi_gmt_bridge import (
@@ -223,6 +224,44 @@ def test_audio_clock_and_playback_start_on_first_generated_tick_then_end_idle(
         request.metadata["condition_sequence"] != "text: stand still"
         for request in planner.requests
     )
+    assert "audio_ended" in player.stops
+    runtime.close()
+
+
+def test_effective_audio_end_discards_generated_tail_and_starts_smooth_idle_return(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "trim-tail.wav"
+    waveform = np.concatenate(
+        (
+            np.full((4,), 12000, dtype=np.int16),
+            np.zeros((8,), dtype=np.int16),
+        )
+    )
+    wavfile.write(path, 100, waveform)
+    controller = DynamicConditionController(
+        tracker_fps=50.0,
+        audio_tail_silence_min_seconds=0.05,
+        audio_tail_analysis_window_seconds=0.01,
+    )
+    runtime, planner, _publisher, player = _runtime(controller)
+    controller.accept_audio(str(path))
+    runtime.step()
+    planner.responses.append(_response(planner.requests[0]))
+
+    first_motion = runtime.step()
+    assert first_motion.source == "generated"
+    snapshot = controller.snapshot()
+    assert snapshot.audio_source_duration_seconds == pytest.approx(0.12)
+    assert snapshot.audio_effective_duration_seconds == pytest.approx(0.04)
+    assert snapshot.audio_trailing_silence_seconds == pytest.approx(0.08)
+    assert snapshot.audio_end_tracker_frame == first_motion.frame_index + 2
+
+    runtime.step()
+    first_return = runtime.step()
+    assert controller.snapshot().command_type == "stand"
+    assert first_return.source == "return_to_idle"
+    assert first_return.plan_remaining_frames == 0
     assert "audio_ended" in player.stops
     runtime.close()
 

@@ -213,8 +213,10 @@ audio /absolute/path/music.wav
 发送给 GMT”开始，不从命令接受或 diffusion 开始时刻计时。
 
 - WAV 推理期间保持固定站立。
-- 第一帧音乐动作与 `ffplay` 在同一 50 Hz tick 启动。
-- 音乐按 WAV 真实时长执行，不循环。
+- 第一帧音乐动作 packet 先发送；GMT ACK 后才启动 `ffplay` 和执行时钟。
+- 默认检测低于 -50 dBFS、连续至少 0.5 秒的 WAV 尾部静音，以有效音乐时长
+  执行，不循环。20 ms 分析窗最多保留最后一个有声窗。
+- 到有效结束帧时停止 `ffplay`、清空剩余音乐 plan，并从当帧平滑回站。
 - 自然结束后平滑回固定站立。
 - 新 text、stand 或新 audio 会终止旧 `ffplay`。
 - 不加 `--play-audio` 时仍会生成音乐动作，但电脑不播放声音。
@@ -739,6 +741,9 @@ python -m omg.cli.realtime.command_client status
 | `--redis-ack-key` | `<redis-key>_ack` | 是 | GMT接收确认key |
 | `--redis-ack-poll-ms` | `5` | 是 | OMG轮询ACK间隔 |
 | `--audio-ack-timeout-ms` | `2000` | 是 | 音乐首帧等待GMT确认上限；超时回站 |
+| `--audio-tail-silence-dbfs` | `-50` | 是 | 尾部静音 RMS 阈值 |
+| `--audio-tail-silence-min-seconds` | `0.5` | 是 | 达到该连续长度才裁剪静音尾巴 |
+| `--audio-tail-analysis-window-ms` | `20` | 是 | 尾部静音 RMS 分析窗 |
 | `--redis-ttl-ms` | `500` | 是 | packet TTL |
 | `--tracker-fps` | `50` | 是 | Bridge/Redis 参考帧率 |
 | `--history-fps` | `30` | 是 | Planner history 帧率 |

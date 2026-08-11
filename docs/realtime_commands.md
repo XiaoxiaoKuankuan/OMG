@@ -6,7 +6,9 @@
 
 - 文本命令会持续生效，桥接器不断滚动生成对应动作，直到收到下一条命令。
 - 音乐从第一次使用该命令规划时的机器人 tracker frame 开始，按机器人实际执行帧推进，而不是按扩散推理耗时或规划次数推进。
-- 音乐只播放自身 WAV 时长，不循环；结束后自动切换到 `text: stand still` 并请求站立计划。
+- 音乐不循环。默认用 20 ms RMS 窗检测低于 -50 dBFS、连续至少 0.5 秒的尾部
+  静音，并按裁剪后的有效 WAV 时长结束；原始时长、有效时长和裁剪时长都会写入
+  status。不同 bridge 沿用各自既有的站立策略。
 - `stand` 立即改变有效条件，但不会清空当前动作缓冲区。
 - 所有切换采用 `next_replan`：没有 pending 请求时立即重规划；已有请求时先追加返回的旧计划保证连续性，随后立即用最新命令重规划。新计划到达时只裁剪尚未执行的未来动作。
 - `quit` 只关闭命令客户端，不关闭 bridge 或 planner server。
@@ -214,6 +216,9 @@ export PYTHONPATH=/home/unitree/OMG/src:$PYTHONPATH
     "condition_session_id": "...",
     "condition_index": 0,
     "audio_duration_seconds": null,
+    "audio_source_duration_seconds": null,
+    "audio_effective_duration_seconds": null,
+    "audio_trailing_silence_seconds": null,
     "audio_start_tracker_frame": null,
     "audio_end_tracker_frame": null
   }
@@ -232,6 +237,7 @@ export PYTHONPATH=/home/unitree/OMG/src:$PYTHONPATH
 
 ```text
 [dynamic-condition] accepted command_id=abc type=audio revision=4
+[dynamic-condition] audio timing path=/absolute/path/music.wav source=12.000000s effective=10.000000s trimmed_tail=2.000000s threshold=-50.0dBFS
 [dynamic-condition] audio start command_id=abc path=/absolute/path/music.wav duration=10.000000s start_frame=1250
 [dynamic-condition] audio ended command_id=abc frame=1750; switching to stand
 ```

@@ -604,6 +604,17 @@ class BumiGmtRuntime:
                 "output_source": tick.source,
                 "plan_remaining_frames": tick.plan_remaining_frames,
                 "packet_sequence": self.packet_sequence,
+                "audio_source_duration_seconds": (
+                    snapshot.audio_source_duration_seconds
+                ),
+                "audio_effective_duration_seconds": (
+                    snapshot.audio_effective_duration_seconds
+                ),
+                "audio_trailing_silence_seconds": (
+                    snapshot.audio_trailing_silence_seconds
+                ),
+                "audio_start_tracker_frame": snapshot.audio_start_tracker_frame,
+                "audio_end_tracker_frame": snapshot.audio_end_tracker_frame,
                 "redis_queued": redis_queued,
                 "redis": self.publisher.status() if hasattr(self.publisher, "status") else {},
                 "audio_playback": self.audio_player.status(),
@@ -694,6 +705,17 @@ class BumiGmtRuntime:
             "active_plan_revision": self.active_plan_revision,
             "last_plan_id": self.last_plan_id,
             "packet_sequence": self.packet_sequence,
+            "audio_source_duration_seconds": (
+                snapshot.audio_source_duration_seconds
+            ),
+            "audio_effective_duration_seconds": (
+                snapshot.audio_effective_duration_seconds
+            ),
+            "audio_trailing_silence_seconds": (
+                snapshot.audio_trailing_silence_seconds
+            ),
+            "audio_start_tracker_frame": snapshot.audio_start_tracker_frame,
+            "audio_end_tracker_frame": snapshot.audio_end_tracker_frame,
             "failed_command_revision": self._failed_command_revision,
             "mux": self.mux.status(),
             "audio_playback": self.audio_player.status(),
@@ -733,6 +755,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--audio-fps", type=float, default=30.0)
     parser.add_argument("--audio-type", choices=["audio", "feature"], default="audio")
     parser.add_argument("--audio-feature-type", choices=["current35"], default="current35")
+    parser.add_argument(
+        "--audio-tail-silence-dbfs",
+        type=float,
+        default=-50.0,
+        help="RMS threshold used to detect a continuous silent WAV tail",
+    )
+    parser.add_argument(
+        "--audio-tail-silence-min-seconds",
+        type=float,
+        default=0.5,
+        help="Minimum continuous silent tail to trim",
+    )
+    parser.add_argument(
+        "--audio-tail-analysis-window-ms",
+        type=float,
+        default=20.0,
+        help="RMS analysis window for WAV tail-silence detection",
+    )
     parser.add_argument("--condition-audio-step-frames", type=int, default=None)
     parser.add_argument("--play-audio", action="store_true")
     parser.add_argument("--ffplay", default="ffplay")
@@ -803,7 +843,13 @@ def main() -> None:
         status_interval_seconds=args.status_interval_seconds,
     )
     controller = DynamicConditionController(
-        tracker_fps=args.tracker_fps, initial_condition_sequence="text: stand still"
+        tracker_fps=args.tracker_fps,
+        initial_condition_sequence="text: stand still",
+        audio_tail_silence_threshold_dbfs=args.audio_tail_silence_dbfs,
+        audio_tail_silence_min_seconds=args.audio_tail_silence_min_seconds,
+        audio_tail_analysis_window_seconds=(
+            float(args.audio_tail_analysis_window_ms) / 1000.0
+        ),
     )
     mux = BumiMotionSourceMux(
         idle_qpos,

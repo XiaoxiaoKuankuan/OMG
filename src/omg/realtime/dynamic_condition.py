@@ -15,6 +15,20 @@ CommandType = Literal["text", "audio", "stand"]
 
 
 @dataclass(frozen=True)
+class WavTiming:
+    path: Path
+    sample_rate: int
+    sample_count: int
+    source_duration_seconds: float
+    effective_duration_seconds: float
+    trailing_silence_seconds: float
+    silence_threshold_dbfs: float
+    minimum_trailing_silence_seconds: float
+    analysis_window_seconds: float
+    has_audible_content: bool
+
+
+@dataclass(frozen=True)
 class RuntimeCommand:
     command_id: str
     command_type: CommandType
@@ -37,6 +51,9 @@ class ConditionSnapshot:
     audio_duration_seconds: float | None
     audio_start_tracker_frame: int | None
     audio_end_tracker_frame: int | None
+    audio_source_duration_seconds: float | None = None
+    audio_effective_duration_seconds: float | None = None
+    audio_trailing_silence_seconds: float | None = None
 
     def metadata(
         self,
@@ -60,7 +77,126 @@ class ConditionSnapshot:
             "audio_type": str(audio_type),
             "audio_feature_type": str(audio_feature_type),
             "condition_audio_step_frames": int(condition_audio_step_frames),
+            "audio_source_duration_seconds": self.audio_source_duration_seconds,
+            "audio_effective_duration_seconds": self.audio_effective_duration_seconds,
+            "audio_trailing_silence_seconds": self.audio_trailing_silence_seconds,
         }
+
+
+def _wav_full_scale(dtype: np.dtype[Any]) -> tuple[float, float]:
+    """Return the PCM zero point and positive full-scale magnitude."""
+
+    if np.issubdtype(dtype, np.unsignedinteger):
+        info = np.iinfo(dtype)
+        zero = float(info.min + (info.max - info.min + 1) / 2)
+        return zero, max(1.0, float(info.max) - zero + 1.0)
+    if np.issubdtype(dtype, np.signedinteger):
+        info = np.iinfo(dtype)
+        return 0.0, max(abs(float(info.min)), abs(float(info.max)))
+    if np.issubdtype(dtype, np.floating):
+        return 0.0, 1.0
+    raise ValueError(f"Unsupported WAV sample dtype: {dtype}")
+
+
+def analyze_wav_timing(
+    value: object,
+    *,
+    silence_threshold_dbfs: float = -50.0,
+    minimum_trailing_silence_seconds: float = 0.5,
+    analysis_window_seconds: float = 0.02,
+) -> WavTiming:
+    """Validate a WAV and find a sufficiently long continuous silent tail.
+
+    Silence is measured as the RMS level of short windows relative to PCM full
+    scale.  The final non-silent window is retained, so the effective endpoint
+    is never rounded earlier than audible content.  An entirely silent WAV is
+    intentionally left untrimmed for backwards compatibility.
+    """
+
+    threshold_dbfs = float(silence_threshold_dbfs)
+    minimum_silence = float(minimum_trailing_silence_seconds)
+    window_seconds = float(analysis_window_seconds)
+    if not np.isfinite(threshold_dbfs) or threshold_dbfs >= 0.0:
+        raise ValueError("silence_threshold_dbfs must be finite and below 0 dBFS")
+    if not np.isfinite(minimum_silence) or minimum_silence < 0.0:
+        raise ValueError(
+            "minimum_trailing_silence_seconds must be non-negative and finite"
+        )
+    if not np.isfinite(window_seconds) or window_seconds <= 0.0:
+        raise ValueError("analysis_window_seconds must be positive and finite")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("audio_path must be a non-empty absolute path")
+    path = Path(value.strip())
+    if not path.is_absolute():
+        raise ValueError(f"audio_path must be absolute, got {path}")
+    if not path.exists():
+        raise FileNotFoundError(f"Audio path does not exist: {path}")
+    if not path.is_file():
+        raise ValueError(f"audio_path must be a file, got {path}")
+    if path.suffix.lower() != ".wav":
+        raise ValueError(f"audio_path must have .wav suffix, got {path}")
+
+    from scipy.io import wavfile
+
+    sample_rate, waveform = wavfile.read(path)
+    sample_rate = int(sample_rate)
+    if sample_rate <= 0:
+        raise ValueError(f"WAV sample rate must be positive, got {sample_rate} for {path}")
+    audio = np.asarray(waveform)
+    if audio.ndim <= 0 or int(audio.shape[0]) <= 0:
+        raise ValueError(f"WAV must contain at least one sample: {path}")
+    if not np.isfinite(audio).all():
+        raise ValueError(f"WAV contains non-finite samples: {path}")
+
+    sample_count = int(audio.shape[0])
+    source_duration = float(sample_count) / float(sample_rate)
+    if not np.isfinite(source_duration) or source_duration <= 0.0:
+        raise ValueError(
+            f"WAV duration must be positive and finite, got {source_duration} for {path}"
+        )
+
+    zero, full_scale = _wav_full_scale(audio.dtype)
+    threshold = 10.0 ** (threshold_dbfs / 20.0)
+    window_samples = max(1, int(round(window_seconds * sample_rate)))
+    last_audible_window_end: int | None = None
+    window_end = sample_count
+    while window_end > 0:
+        window_start = max(0, window_end - window_samples)
+        values = (audio[window_start:window_end].astype(np.float64) - zero) / full_scale
+        if values.ndim > 1:
+            channel_axes = tuple(range(1, values.ndim))
+            values = np.max(np.abs(values), axis=channel_axes)
+        rms = float(np.sqrt(np.mean(np.square(values), dtype=np.float64)))
+        if rms > threshold:
+            last_audible_window_end = window_end
+            break
+        window_end = window_start
+
+    has_audible_content = last_audible_window_end is not None
+    effective_sample_count = sample_count
+    trailing_silence = 0.0
+    if has_audible_content:
+        candidate = int(last_audible_window_end)
+        candidate_trailing = float(sample_count - candidate) / float(sample_rate)
+        if candidate_trailing + (0.5 / sample_rate) >= minimum_silence:
+            effective_sample_count = max(1, candidate)
+            trailing_silence = float(sample_count - effective_sample_count) / float(
+                sample_rate
+            )
+
+    effective_duration = float(effective_sample_count) / float(sample_rate)
+    return WavTiming(
+        path=path.resolve(),
+        sample_rate=sample_rate,
+        sample_count=sample_count,
+        source_duration_seconds=source_duration,
+        effective_duration_seconds=effective_duration,
+        trailing_silence_seconds=trailing_silence,
+        silence_threshold_dbfs=threshold_dbfs,
+        minimum_trailing_silence_seconds=minimum_silence,
+        analysis_window_seconds=window_seconds,
+        has_audible_content=has_audible_content,
+    )
 
 
 def compute_condition_audio_step_frames(
@@ -117,6 +253,9 @@ class DynamicConditionController:
         *,
         tracker_fps: float,
         initial_condition_sequence: str = "text: stand still",
+        audio_tail_silence_threshold_dbfs: float = -50.0,
+        audio_tail_silence_min_seconds: float = 0.5,
+        audio_tail_analysis_window_seconds: float = 0.02,
     ) -> None:
         fps = float(tracker_fps)
         if not np.isfinite(fps) or fps <= 0.0:
@@ -124,7 +263,25 @@ class DynamicConditionController:
         initial = str(initial_condition_sequence).strip()
         if not initial:
             raise ValueError("initial_condition_sequence must be non-empty")
+        threshold_dbfs = float(audio_tail_silence_threshold_dbfs)
+        minimum_silence = float(audio_tail_silence_min_seconds)
+        analysis_window = float(audio_tail_analysis_window_seconds)
+        if not np.isfinite(threshold_dbfs) or threshold_dbfs >= 0.0:
+            raise ValueError(
+                "audio_tail_silence_threshold_dbfs must be finite and below 0"
+            )
+        if not np.isfinite(minimum_silence) or minimum_silence < 0.0:
+            raise ValueError(
+                "audio_tail_silence_min_seconds must be non-negative and finite"
+            )
+        if not np.isfinite(analysis_window) or analysis_window <= 0.0:
+            raise ValueError(
+                "audio_tail_analysis_window_seconds must be positive and finite"
+            )
         self._tracker_fps = fps
+        self._audio_tail_silence_threshold_dbfs = threshold_dbfs
+        self._audio_tail_silence_min_seconds = minimum_silence
+        self._audio_tail_analysis_window_seconds = analysis_window
         self._lock = threading.RLock()
         self._revision = 0
         self._condition_session_id = uuid.uuid4().hex
@@ -132,6 +289,8 @@ class DynamicConditionController:
         self._condition_sequence = initial
         self._audio_start_tracker_frame: int | None = None
         self._audio_duration_seconds: float | None = None
+        self._audio_source_duration_seconds: float | None = None
+        self._audio_trailing_silence_seconds: float | None = None
         self._audio_end_tracker_frame: int | None = None
         self._last_requested_revision: int | None = None
         self._auto_stand_transitioned = False
@@ -179,14 +338,14 @@ class DynamicConditionController:
             )
         if lowered.startswith("audio:") and "|" not in sequence:
             audio_path = sequence.split(":", 1)[1].strip()
-            path, duration = self._validate_audio_path(audio_path)
-            self._condition_sequence = f"audio: {path}"
-            self._audio_duration_seconds = duration
+            timing = self._validate_audio_path(audio_path)
+            self._condition_sequence = f"audio: {timing.path}"
+            self._set_audio_timing_locked(timing)
             return RuntimeCommand(
                 command_id=command_id,
                 command_type="audio",
                 text=None,
-                audio_path=str(path),
+                audio_path=str(timing.path),
                 audio_type="audio",
                 on_end="stand",
                 accepted_wall_time=now,
@@ -224,32 +383,24 @@ class DynamicConditionController:
             raise ValueError("text must not contain '|' because it separates condition chunks")
         return text
 
-    @staticmethod
-    def _validate_audio_path(value: object) -> tuple[Path, float]:
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError("audio_path must be a non-empty absolute path")
-        path = Path(value.strip())
-        if not path.is_absolute():
-            raise ValueError(f"audio_path must be absolute, got {path}")
-        if not path.exists():
-            raise FileNotFoundError(f"Audio path does not exist: {path}")
-        if not path.is_file():
-            raise ValueError(f"audio_path must be a file, got {path}")
-        if path.suffix.lower() != ".wav":
-            raise ValueError(f"audio_path must have .wav suffix, got {path}")
-        from scipy.io import wavfile
+    def _validate_audio_path(self, value: object) -> WavTiming:
+        return analyze_wav_timing(
+            value,
+            silence_threshold_dbfs=self._audio_tail_silence_threshold_dbfs,
+            minimum_trailing_silence_seconds=self._audio_tail_silence_min_seconds,
+            analysis_window_seconds=self._audio_tail_analysis_window_seconds,
+        )
 
-        sample_rate, waveform = wavfile.read(path)
-        sample_rate = int(sample_rate)
-        if sample_rate <= 0:
-            raise ValueError(f"WAV sample rate must be positive, got {sample_rate} for {path}")
-        audio = np.asarray(waveform)
-        if audio.ndim <= 0 or int(audio.shape[0]) <= 0:
-            raise ValueError(f"WAV must contain at least one sample: {path}")
-        duration = float(audio.shape[0]) / float(sample_rate)
-        if not np.isfinite(duration) or duration <= 0.0:
-            raise ValueError(f"WAV duration must be positive and finite, got {duration} for {path}")
-        return path.resolve(), duration
+    def _set_audio_timing_locked(self, timing: WavTiming | None) -> None:
+        self._audio_duration_seconds = (
+            None if timing is None else float(timing.effective_duration_seconds)
+        )
+        self._audio_source_duration_seconds = (
+            None if timing is None else float(timing.source_duration_seconds)
+        )
+        self._audio_trailing_silence_seconds = (
+            None if timing is None else float(timing.trailing_silence_seconds)
+        )
 
     def _replace_command_locked(
         self,
@@ -258,7 +409,7 @@ class DynamicConditionController:
         command_type: CommandType,
         text: str | None,
         audio_path: str | None,
-        audio_duration_seconds: float | None,
+        audio_timing: WavTiming | None,
         condition_sequence: str,
     ) -> RuntimeCommand:
         self._revision += 1
@@ -267,7 +418,7 @@ class DynamicConditionController:
         self._condition_sequence = str(condition_sequence)
         self._audio_start_tracker_frame = None
         self._audio_end_tracker_frame = None
-        self._audio_duration_seconds = audio_duration_seconds
+        self._set_audio_timing_locked(audio_timing)
         self._auto_stand_transitioned = False
         command = RuntimeCommand(
             command_id=command_id,
@@ -295,7 +446,7 @@ class DynamicConditionController:
                 command_type="text",
                 text=validated,
                 audio_path=None,
-                audio_duration_seconds=None,
+                audio_timing=None,
                 condition_sequence=f"text: {validated}",
             )
 
@@ -311,16 +462,25 @@ class DynamicConditionController:
             raise ValueError("audio_type must be 'audio'; looping/precomputed modes are not supported")
         if on_end != "stand":
             raise ValueError("on_end must be 'stand'")
-        path, duration = self._validate_audio_path(audio_path)
+        timing = self._validate_audio_path(audio_path)
         with self._lock:
-            return self._replace_command_locked(
+            command = self._replace_command_locked(
                 command_id=self._command_id(command_id),
                 command_type="audio",
                 text=None,
-                audio_path=str(path),
-                audio_duration_seconds=duration,
-                condition_sequence=f"audio: {path}",
+                audio_path=str(timing.path),
+                audio_timing=timing,
+                condition_sequence=f"audio: {timing.path}",
             )
+            print(
+                "[dynamic-condition] audio timing "
+                f"path={timing.path} source={timing.source_duration_seconds:.6f}s "
+                f"effective={timing.effective_duration_seconds:.6f}s "
+                f"trimmed_tail={timing.trailing_silence_seconds:.6f}s "
+                f"threshold={timing.silence_threshold_dbfs:.1f}dBFS",
+                flush=True,
+            )
+            return command
 
     def accept_stand(self, *, command_id: object | None = None) -> RuntimeCommand:
         with self._lock:
@@ -329,7 +489,7 @@ class DynamicConditionController:
                 command_type="stand",
                 text="stand still",
                 audio_path=None,
-                audio_duration_seconds=None,
+                audio_timing=None,
                 condition_sequence="text: stand still",
             )
 
@@ -363,6 +523,9 @@ class DynamicConditionController:
             audio_duration_seconds=self._audio_duration_seconds,
             audio_start_tracker_frame=self._audio_start_tracker_frame,
             audio_end_tracker_frame=self._audio_end_tracker_frame,
+            audio_source_duration_seconds=self._audio_source_duration_seconds,
+            audio_effective_duration_seconds=self._audio_duration_seconds,
+            audio_trailing_silence_seconds=self._audio_trailing_silence_seconds,
         )
 
     def snapshot(self) -> ConditionSnapshot:
@@ -474,13 +637,15 @@ class DynamicConditionController:
             ended_command = self._command
             audio_path = ended_command.audio_path
             duration = float(self._audio_duration_seconds)
+            source_duration = float(self._audio_source_duration_seconds)
+            trailing_silence = float(self._audio_trailing_silence_seconds)
             self._revision += 1
             self._condition_session_id = uuid.uuid4().hex
             self._condition_index = 0
             self._condition_sequence = "text: stand still"
             self._audio_start_tracker_frame = None
             self._audio_end_tracker_frame = None
-            self._audio_duration_seconds = None
+            self._set_audio_timing_locked(None)
             self._auto_stand_transitioned = True
             self._command = RuntimeCommand(
                 command_id=uuid.uuid4().hex,
@@ -502,6 +667,9 @@ class DynamicConditionController:
                 "command_id": ended_command.command_id,
                 "audio_path": audio_path,
                 "duration_seconds": duration,
+                "source_duration_seconds": source_duration,
+                "effective_duration_seconds": duration,
+                "trimmed_trailing_silence_seconds": trailing_silence,
                 "tracker_frame": frame,
                 "next_condition": "text: stand still",
             }
@@ -522,6 +690,15 @@ class DynamicConditionController:
                 "condition_session_id": snapshot.condition_session_id,
                 "condition_index": int(snapshot.condition_index),
                 "audio_duration_seconds": snapshot.audio_duration_seconds,
+                "audio_source_duration_seconds": (
+                    snapshot.audio_source_duration_seconds
+                ),
+                "audio_effective_duration_seconds": (
+                    snapshot.audio_effective_duration_seconds
+                ),
+                "audio_trailing_silence_seconds": (
+                    snapshot.audio_trailing_silence_seconds
+                ),
                 "audio_start_tracker_frame": snapshot.audio_start_tracker_frame,
                 "audio_end_tracker_frame": snapshot.audio_end_tracker_frame,
             }
