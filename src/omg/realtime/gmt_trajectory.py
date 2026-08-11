@@ -34,11 +34,70 @@ TRAJECTORY_PLAN_FRAMES = 100
 TRAJECTORY_FRAME_COUNT = TRAJECTORY_HISTORY_FRAMES + TRAJECTORY_PLAN_FRAMES
 TRAJECTORY_CURRENT_INDEX = TRAJECTORY_HISTORY_FRAMES
 
+TRAJECTORY_ACK_MAGIC = b"OMGBTA01"
+TRAJECTORY_ACK_VERSION = 1
+TRAJECTORY_ACK_FORMAT = "<8sHHQQqqQ"
+TRAJECTORY_ACK_SIZE = struct.calcsize(TRAJECTORY_ACK_FORMAT)
+
 FLAG_FIXED_IDLE = 1 << 0
 FLAG_TRANSITION = 1 << 1
 FLAG_TEXT = 1 << 2
 FLAG_AUDIO = 1 << 3
 FLAG_ERROR = 1 << 4
+
+
+@dataclass(frozen=True)
+class GmtTrajectoryAck:
+    """Acknowledgement written by GMT after accepting a trajectory packet."""
+
+    stream_id: int
+    sequence: int
+    command_revision: int
+    plan_id: int
+    received_unix_ns: int
+
+    def encode(self) -> bytes:
+        return struct.pack(
+            TRAJECTORY_ACK_FORMAT,
+            TRAJECTORY_ACK_MAGIC,
+            TRAJECTORY_ACK_VERSION,
+            TRAJECTORY_ACK_SIZE,
+            int(self.stream_id),
+            int(self.sequence),
+            int(self.command_revision),
+            int(self.plan_id),
+            int(self.received_unix_ns),
+        )
+
+    @classmethod
+    def decode(cls, blob: bytes | bytearray | memoryview) -> "GmtTrajectoryAck":
+        value = bytes(blob)
+        if len(value) != TRAJECTORY_ACK_SIZE:
+            raise ValueError(
+                f"trajectory ACK must contain {TRAJECTORY_ACK_SIZE} bytes, "
+                f"got {len(value)}"
+            )
+        (
+            magic,
+            version,
+            size,
+            stream_id,
+            sequence,
+            command_revision,
+            plan_id,
+            received_unix_ns,
+        ) = struct.unpack(TRAJECTORY_ACK_FORMAT, value)
+        if magic != TRAJECTORY_ACK_MAGIC or version != TRAJECTORY_ACK_VERSION:
+            raise ValueError("unsupported GMT trajectory ACK magic/version")
+        if size != TRAJECTORY_ACK_SIZE:
+            raise ValueError(f"unsupported GMT trajectory ACK size {size}")
+        return cls(
+            stream_id=int(stream_id),
+            sequence=int(sequence),
+            command_revision=int(command_revision),
+            plan_id=int(plan_id),
+            received_unix_ns=int(received_unix_ns),
+        )
 
 
 def joint_order_sha256(joint_names: Iterable[str]) -> bytes:

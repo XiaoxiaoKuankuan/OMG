@@ -138,9 +138,10 @@ quit
 ```
 
 `quit` 只退出命令客户端。文本持续滚动生成，直到下一条命令。WAV 从第一帧
-音乐动作真正发给 GMT 的同一个 50 Hz tick 开始计时和播放，不把 diffusion
-推理耗时计入音乐时间轴；自然结束后平滑回固定站立。新文本、`stand` 或新音乐
-会终止旧 ffplay 进程。
+音乐动作发布后等待 GMT 确认：GMT 成功读取并校验该 `sequence` 后写入独立的
+`gmt_online_frame_bumi_ack` key，OMG 收到同一 stream/revision/sequence 的 ACK
+才启动 ffplay 和音乐执行时钟。diffusion 推理耗时不计入音乐时间轴；自然结束
+后平滑回固定站立。新文本、`stand` 或新音乐会终止旧 ffplay 进程。
 
 ## trajectory_v1
 
@@ -156,6 +157,12 @@ body-frame root linear/angular velocity、21 个 joint position 和 21 个 joint
 velocity。packet 同时校验尺寸、有限值、四元数、CRC32 和 GMT policy 关节顺序
 SHA256。
 
+GMT 每次接受新的 `trajectory_v1` sequence 后，将52字节二进制 ACK 写到独立
+Redis key（默认 `<motion-key>_ack`）。ACK包含 stream ID、sequence、command
+revision、plan ID和GMT接收时间。OMG拒绝旧stream、旧revision和过早sequence，
+因此遗留ACK不能触发新音乐。启用 `--play-audio` 后若2秒内没有合法ACK，音乐
+不会播放，当前音频命令会切换到固定站立。
+
 OMG 读取 `bumi_kinematics.json` 的关节顺序，GMT 顺序来自 policy ONNX
 `joint_names`，两边名称集合必须完全相同。不存在旧 GMR 的手写重排数组。
 
@@ -170,4 +177,5 @@ OMG 读取 `bumi_kinematics.json` 的关节顺序，GMT 顺序来自 policy ONNX
 - 网页端口占用：修改 `--sim-stream-bind`，命令服务端口则修改
   `--command-bind`。
 - 音乐无声：确认保留 `--play-audio`、`/usr/bin/ffplay` 存在且终端 1 主机有可用
-  默认音频设备。
+  默认音频设备；同时运行 `redis-cli STRLEN gmt_online_frame_bumi_ack`，合法 ACK
+  长度应为 `52`，并确认 Gazebo 已进入 GMT 模式。GMT 未读取轨迹时不会播放音乐。

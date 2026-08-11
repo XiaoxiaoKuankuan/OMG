@@ -31,6 +31,7 @@ from omg.realtime.gmt_trajectory import (
     FLAG_TEXT,
     FLAG_TRANSITION,
     TRAJECTORY_FRAME_COUNT,
+    GmtTrajectoryAck,
     GmtPolicyContract,
     build_policy_default_idle_qpos,
     make_trajectory_packet,
@@ -38,6 +39,8 @@ from omg.realtime.gmt_trajectory import (
 from omg.realtime.protocol import MotionPlanChunk, RobotStateRequest
 from omg.realtime.redis_trajectory import (
     AsyncRedisTrajectoryPublisher,
+    RedisTrajectoryAckReader,
+    RedisTrajectoryAckReaderConfig,
     RedisTrajectoryPublisher,
     RedisTrajectoryPublisherConfig,
 )
@@ -57,6 +60,7 @@ class BumiGmtRuntimeConfig:
     audio_feature_type: str = "current35"
     condition_audio_step_frames: int = 24
     request_timeout_ms: int = 120000
+    audio_ack_timeout_seconds: float = 2.0
     status_interval_seconds: float = 1.0
 
     def __post_init__(self) -> None:
@@ -65,6 +69,7 @@ class BumiGmtRuntimeConfig:
             ("history_fps", self.history_fps),
             ("audio_fps", self.audio_fps),
             ("status_interval_seconds", self.status_interval_seconds),
+            ("audio_ack_timeout_seconds", self.audio_ack_timeout_seconds),
         ):
             if not np.isfinite(float(value)) or float(value) <= 0.0:
                 raise ValueError(f"{name} must be positive and finite")
@@ -86,6 +91,15 @@ class PendingReplan:
     condition_index_committed: bool
 
 
+@dataclass(frozen=True)
+class PendingAudioAck:
+    command_id: str
+    command_revision: int
+    packet_sequence: int
+    first_motion_tracker_frame: int
+    armed_perf_time: float
+
+
 class BumiGmtRuntime:
     """Native BUMI OMG planner loop and trajectory_v1 publisher."""
 
@@ -102,6 +116,7 @@ class BumiGmtRuntime:
         native_to_gmt: np.ndarray,
         joint_order_hash: bytes,
         audio_player: SynchronizedAudioPlayer,
+        ack_reader: Any | None = None,
         sim_stream: Any | None = None,
         status_callback: Callable[[dict[str, Any]], None] | None = None,
         planner_client_factory: Callable[[], Any] | None = None,
@@ -118,6 +133,7 @@ class BumiGmtRuntime:
         self.native_to_gmt = np.asarray(native_to_gmt, dtype=np.int64)
         self.joint_order_hash = bytes(joint_order_hash)
         self.audio_player = audio_player
+        self.ack_reader = ack_reader
         self.sim_stream = sim_stream
         self.status_callback = status_callback
         self.planner_client_factory = planner_client_factory
@@ -138,6 +154,7 @@ class BumiGmtRuntime:
         self._accepted_plan_count = 0
         self._planner_error_count = 0
         self._failed_command_revision: int | None = None
+        self._pending_audio_ack: PendingAudioAck | None = None
 
     def _emit(self, event: dict[str, Any]) -> None:
         if self.status_callback is not None:
@@ -365,6 +382,8 @@ class BumiGmtRuntime:
         self._failed_command_revision = None
         if self.audio_player.command_id == previous_command_id:
             self.audio_player.stop(reason="command_changed")
+        if self._pending_audio_ack is not None:
+            self._pending_audio_ack = None
         if snapshot.command_type == "stand":
             self.mux.return_to_idle(reason="stand", error=False)
             self.active_plan_revision = None
@@ -414,7 +433,13 @@ class BumiGmtRuntime:
             flags |= FLAG_AUDIO
         return flags
 
-    def _start_audio_if_needed(
+    def _audio_requires_gmt_ack(self) -> bool:
+        return bool(
+            self.ack_reader is not None
+            and bool(getattr(self.audio_player, "enabled", True))
+        )
+
+    def _start_audio_without_ack_if_needed(
         self, tick: BumiMotionTick, snapshot: ConditionSnapshot
     ) -> None:
         if (
@@ -422,6 +447,8 @@ class BumiGmtRuntime:
             or tick.command_revision != snapshot.revision
             or tick.source not in {"generated_blend", "generated"}
         ):
+            return
+        if self._audio_requires_gmt_ack():
             return
         started = self.controller.mark_audio_execution_started(
             snapshot, current_tracker_frame=self.cursor
@@ -435,6 +462,127 @@ class BumiGmtRuntime:
                     command_id=snapshot.command_id,
                     tracker_frame=self.cursor,
                 )
+
+    def _arm_audio_ack_if_needed(
+        self,
+        tick: BumiMotionTick,
+        snapshot: ConditionSnapshot,
+        *,
+        packet_sequence: int,
+        redis_queued: bool,
+    ) -> None:
+        if (
+            not self._audio_requires_gmt_ack()
+            or not redis_queued
+            or self._pending_audio_ack is not None
+            or snapshot.command_type != "audio"
+            or snapshot.audio_start_tracker_frame is not None
+            or tick.command_revision != snapshot.revision
+            or tick.source not in {"generated_blend", "generated"}
+        ):
+            return
+        self._pending_audio_ack = PendingAudioAck(
+            command_id=snapshot.command_id,
+            command_revision=int(snapshot.revision),
+            packet_sequence=int(packet_sequence),
+            first_motion_tracker_frame=int(self.cursor),
+            armed_perf_time=float(self.clock()),
+        )
+        self._emit(
+            {
+                "kind": "audio_waiting_for_gmt_ack",
+                "tracker_frame": self.cursor,
+                "command_id": snapshot.command_id,
+                "command_revision": snapshot.revision,
+                "stream_id": self.stream_id,
+                "packet_sequence": int(packet_sequence),
+            }
+        )
+        print(
+            f"[audio-playback] waiting for GMT ACK command_id={snapshot.command_id} "
+            f"stream_id={self.stream_id} sequence={packet_sequence}",
+            flush=True,
+        )
+
+    def _poll_audio_ack(self) -> None:
+        pending = self._pending_audio_ack
+        if pending is None or self.ack_reader is None:
+            return
+        snapshot = self.controller.snapshot()
+        if (
+            snapshot.command_type != "audio"
+            or snapshot.command_id != pending.command_id
+            or snapshot.revision != pending.command_revision
+        ):
+            self._pending_audio_ack = None
+            return
+        ack: GmtTrajectoryAck | None = self.ack_reader.latest_ack()
+        matches = bool(
+            ack is not None
+            and ack.stream_id == self.stream_id
+            and ack.sequence >= pending.packet_sequence
+            and ack.command_revision == pending.command_revision
+        )
+        if matches:
+            assert ack is not None
+            self._pending_audio_ack = None
+            started = self.controller.mark_audio_execution_started(
+                snapshot, current_tracker_frame=self.cursor
+            )
+            if not started:
+                return
+            active = self.controller.active_status()
+            audio_path = active.get("audio_path")
+            if audio_path is None:
+                return
+            self.audio_player.start(
+                audio_path,
+                command_id=snapshot.command_id,
+                tracker_frame=self.cursor,
+            )
+            latency = max(0.0, float(self.clock()) - pending.armed_perf_time)
+            self._emit(
+                {
+                    "kind": "audio_started_after_gmt_ack",
+                    "tracker_frame": self.cursor,
+                    "first_motion_tracker_frame": pending.first_motion_tracker_frame,
+                    "command_id": snapshot.command_id,
+                    "command_revision": snapshot.revision,
+                    "stream_id": self.stream_id,
+                    "requested_sequence": pending.packet_sequence,
+                    "ack_sequence": ack.sequence,
+                    "ack_received_unix_ns": ack.received_unix_ns,
+                    "ack_latency_seconds": latency,
+                }
+            )
+            print(
+                f"[audio-playback] GMT ACK received command_id={snapshot.command_id} "
+                f"sequence={ack.sequence} latency={latency * 1000.0:.1f}ms; "
+                "starting ffplay",
+                flush=True,
+            )
+            return
+        elapsed = max(0.0, float(self.clock()) - pending.armed_perf_time)
+        if elapsed < float(self.config.audio_ack_timeout_seconds):
+            return
+        self._pending_audio_ack = None
+        self._emit(
+            {
+                "kind": "audio_gmt_ack_timeout",
+                "tracker_frame": self.cursor,
+                "command_id": pending.command_id,
+                "command_revision": pending.command_revision,
+                "stream_id": self.stream_id,
+                "packet_sequence": pending.packet_sequence,
+                "timeout_seconds": float(self.config.audio_ack_timeout_seconds),
+            }
+        )
+        print(
+            f"[audio-playback] GMT ACK timeout command_id={pending.command_id} "
+            f"sequence={pending.packet_sequence}; switching to fixed idle",
+            flush=True,
+        )
+        self.controller.accept_stand()
 
     def _periodic_status(
         self, tick: BumiMotionTick, snapshot: ConditionSnapshot, redis_queued: bool
@@ -459,6 +607,10 @@ class BumiGmtRuntime:
                 "redis_queued": redis_queued,
                 "redis": self.publisher.status() if hasattr(self.publisher, "status") else {},
                 "audio_playback": self.audio_player.status(),
+                "audio_ack_pending": self._pending_audio_ack is not None,
+                "redis_ack": (
+                    self.ack_reader.status() if self.ack_reader is not None else None
+                ),
                 "planner_error_count": self._planner_error_count,
                 "failed_command_revision": self._failed_command_revision,
                 "stale_plan_count": self._stale_plan_count,
@@ -468,6 +620,7 @@ class BumiGmtRuntime:
     def step(self) -> BumiMotionTick:
         if self._closed:
             raise RuntimeError("BUMI→GMT runtime is closed")
+        self._poll_audio_ack()
         audio_end = self.controller.update_for_tracker_frame(self.cursor)
         if audio_end is not None:
             self.audio_player.stop(reason="audio_ended")
@@ -479,7 +632,7 @@ class BumiGmtRuntime:
             self._begin_replan()
         tick = self.mux.tick(self.cursor)
         snapshot = self.controller.snapshot()
-        self._start_audio_if_needed(tick, snapshot)
+        self._start_audio_without_ack_if_needed(tick, snapshot)
 
         prefix = self.trajectory_history.packet_prefix(tick.qpos)
         future = self.mux.preview_future(TRAJECTORY_FRAME_COUNT - prefix.shape[0])
@@ -496,6 +649,15 @@ class BumiGmtRuntime:
             flags=self._packet_flags(tick, snapshot),
         )
         redis_queued = bool(self.publisher.publish(packet))
+        self._arm_audio_ack_if_needed(
+            tick,
+            snapshot,
+            packet_sequence=packet.sequence,
+            redis_queued=redis_queued,
+        )
+        # A synchronous/fake ACK source used by tests may already expose the
+        # acknowledgement for the packet that was just queued.
+        self._poll_audio_ack()
         self.packet_sequence += 1
         self.planner_history.append(tick.qpos)
 
@@ -535,6 +697,10 @@ class BumiGmtRuntime:
             "failed_command_revision": self._failed_command_revision,
             "mux": self.mux.status(),
             "audio_playback": self.audio_player.status(),
+            "audio_ack_pending": self._pending_audio_ack is not None,
+            "redis_ack": (
+                self.ack_reader.status() if self.ack_reader is not None else None
+            ),
             "publisher": self.publisher.status() if hasattr(self.publisher, "status") else {},
         }
 
@@ -575,6 +741,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--redis-port", type=int, default=6379)
     parser.add_argument("--redis-db", type=int, default=0)
     parser.add_argument("--redis-key", default="gmt_online_frame_bumi")
+    parser.add_argument(
+        "--redis-ack-key",
+        default=None,
+        help="GMT trajectory ACK key (default: <redis-key>_ack)",
+    )
+    parser.add_argument("--redis-ack-poll-ms", type=float, default=5.0)
+    parser.add_argument("--audio-ack-timeout-ms", type=float, default=2000.0)
     parser.add_argument("--redis-ttl-ms", type=int, default=500)
     parser.add_argument("--sim-stream-bind", default=None)
     parser.add_argument("--sim-stream-fps", type=float, default=20.0)
@@ -626,6 +799,7 @@ def main() -> None:
         audio_feature_type=args.audio_feature_type,
         condition_audio_step_frames=audio_step,
         request_timeout_ms=args.timeout_ms,
+        audio_ack_timeout_seconds=float(args.audio_ack_timeout_ms) / 1000.0,
         status_interval_seconds=args.status_interval_seconds,
     )
     controller = DynamicConditionController(
@@ -659,6 +833,20 @@ def main() -> None:
         )
     )
     publisher = AsyncRedisTrajectoryPublisher(sync_publisher)
+    ack_key = args.redis_ack_key or f"{args.redis_key}_ack"
+    ack_reader = (
+        RedisTrajectoryAckReader(
+            RedisTrajectoryAckReaderConfig(
+                host=args.redis_host,
+                port=args.redis_port,
+                db=args.redis_db,
+                key=ack_key,
+                poll_interval_seconds=float(args.redis_ack_poll_ms) / 1000.0,
+            )
+        )
+        if args.play_audio
+        else None
+    )
     audio_player = SynchronizedAudioPlayer(
         enabled=args.play_audio, executable=args.ffplay
     )
@@ -669,6 +857,8 @@ def main() -> None:
     executed: list[np.ndarray] = []
     try:
         publisher.start()
+        if ack_reader is not None:
+            ack_reader.start()
         if args.sim_stream_bind is not None:
             from omg.realtime.sim_stream import SimStreamConfig, SimStreamServer
 
@@ -700,6 +890,7 @@ def main() -> None:
             native_to_gmt=native_to_gmt,
             joint_order_hash=contract.joint_order_hash,
             audio_player=audio_player,
+            ack_reader=ack_reader,
             sim_stream=sim_stream,
             status_callback=status_callback,
             planner_client_factory=lambda: ZmqPlanClient(args.connect),
@@ -723,7 +914,8 @@ def main() -> None:
         )
         print(
             f"[BUMI→GMT] Redis={args.redis_host}:{args.redis_port}/{args.redis_db} "
-            f"key={args.redis_key} protocol=trajectory_v1 audio_step={audio_step}",
+            f"key={args.redis_key} ack_key={ack_key} "
+            f"protocol=trajectory_v1 audio_step={audio_step}",
             flush=True,
         )
         period = 1.0 / args.tracker_fps
@@ -745,6 +937,7 @@ def main() -> None:
         for close in (
             command_server.close if command_server is not None else None,
             runtime.close if runtime is not None else planner.close,
+            ack_reader.close if ack_reader is not None else None,
             publisher.close,
             sim_stream.close if sim_stream is not None else None,
         ):

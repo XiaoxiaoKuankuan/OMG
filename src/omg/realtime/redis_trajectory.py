@@ -8,7 +8,7 @@ from typing import Any, Callable, Protocol
 
 import numpy as np
 
-from omg.realtime.gmt_trajectory import GmtTrajectoryPacket
+from omg.realtime.gmt_trajectory import GmtTrajectoryAck, GmtTrajectoryPacket
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,8 @@ class RedisTrajectoryPublisherConfig:
 
 class _BinaryRedisConnection(Protocol):
     def set_bytes(self, key: str, payload: bytes, ttl_ms: int) -> None: ...
+
+    def get_bytes(self, key: str) -> bytes | None: ...
 
     def close(self) -> None: ...
 
@@ -101,6 +103,10 @@ class RespBinaryRedisConnection:
 
     def set_bytes(self, key: str, payload: bytes, ttl_ms: int) -> None:
         self.command("SET", str(key), bytes(payload), "PX", str(int(ttl_ms)))
+
+    def get_bytes(self, key: str) -> bytes | None:
+        response = self.command("GET", str(key))
+        return None if response == b"" else bytes(response)
 
     def close(self) -> None:
         try:
@@ -301,3 +307,196 @@ class AsyncRedisTrajectoryPublisher:
                 raise RuntimeError("Async Redis trajectory publisher thread did not stop")
         self._thread = None
         self.publisher.close()
+
+
+@dataclass(frozen=True)
+class RedisTrajectoryAckReaderConfig:
+    host: str = "127.0.0.1"
+    port: int = 6379
+    db: int = 0
+    key: str = "gmt_online_frame_bumi_ack"
+    poll_interval_seconds: float = 0.005
+    connect_timeout_seconds: float = 0.5
+    socket_timeout_seconds: float = 0.5
+    reconnect_interval_seconds: float = 0.25
+    verbose: bool = True
+
+    def __post_init__(self) -> None:
+        if not str(self.host).strip():
+            raise ValueError("Redis ACK host must be non-empty")
+        if not 1 <= int(self.port) <= 65535:
+            raise ValueError("Redis ACK port must be in [1,65535]")
+        if int(self.db) < 0:
+            raise ValueError("Redis ACK db must be non-negative")
+        if not str(self.key):
+            raise ValueError("Redis ACK key must be non-empty")
+        for name, value in (
+            ("poll_interval_seconds", self.poll_interval_seconds),
+            ("connect_timeout_seconds", self.connect_timeout_seconds),
+            ("socket_timeout_seconds", self.socket_timeout_seconds),
+        ):
+            if not np.isfinite(float(value)) or float(value) <= 0.0:
+                raise ValueError(f"{name} must be positive and finite")
+        if (
+            not np.isfinite(float(self.reconnect_interval_seconds))
+            or float(self.reconnect_interval_seconds) < 0.0
+        ):
+            raise ValueError("reconnect_interval_seconds must be non-negative and finite")
+
+
+class RedisTrajectoryAckReader:
+    """Poll the separate GMT acknowledgement key without blocking the 50 Hz loop."""
+
+    def __init__(
+        self,
+        config: RedisTrajectoryAckReaderConfig | None = None,
+        *,
+        connection_factory: Callable[
+            [RedisTrajectoryPublisherConfig], _BinaryRedisConnection
+        ]
+        | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.config = config or RedisTrajectoryAckReaderConfig()
+        self._factory = connection_factory or RespBinaryRedisConnection
+        self._clock = clock
+        self._condition = threading.Condition()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._latest: GmtTrajectoryAck | None = None
+        self._connection: _BinaryRedisConnection | None = None
+        self._next_connect_time = float("-inf")
+        self._connect_attempts = 0
+        self._valid_acks = 0
+        self._decode_errors = 0
+        self._read_errors = 0
+        self._last_error: str | None = None
+
+    @property
+    def is_alive(self) -> bool:
+        return bool(self._thread is not None and self._thread.is_alive())
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("Redis trajectory ACK reader already started")
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="omg-bumi-redis-ack-reader",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def latest_ack(self) -> GmtTrajectoryAck | None:
+        with self._condition:
+            return self._latest
+
+    def _connection_config(self) -> RedisTrajectoryPublisherConfig:
+        return RedisTrajectoryPublisherConfig(
+            host=self.config.host,
+            port=self.config.port,
+            db=self.config.db,
+            key=self.config.key,
+            ttl_ms=1000,
+            connect_timeout_seconds=self.config.connect_timeout_seconds,
+            socket_timeout_seconds=self.config.socket_timeout_seconds,
+            reconnect_interval_seconds=self.config.reconnect_interval_seconds,
+            verbose=False,
+        )
+
+    def _disconnect(self) -> None:
+        connection, self._connection = self._connection, None
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+    def _ensure_connection(self) -> bool:
+        if self._connection is not None:
+            return True
+        now = float(self._clock())
+        if now < self._next_connect_time:
+            return False
+        self._connect_attempts += 1
+        try:
+            self._connection = self._factory(self._connection_config())
+            self._last_error = None
+            if self.config.verbose:
+                print(
+                    f"[OMG BUMI Redis ACK] connected {self.config.host}:"
+                    f"{self.config.port}/{self.config.db} key={self.config.key}",
+                    flush=True,
+                )
+            return True
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self._next_connect_time = now + float(
+                self.config.reconnect_interval_seconds
+            )
+            return False
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            if not self._ensure_connection():
+                self._stop_event.wait(float(self.config.poll_interval_seconds))
+                continue
+            try:
+                assert self._connection is not None
+                payload = self._connection.get_bytes(str(self.config.key))
+                if payload is not None:
+                    try:
+                        ack = GmtTrajectoryAck.decode(payload)
+                    except Exception as exc:
+                        self._decode_errors += 1
+                        self._last_error = f"{type(exc).__name__}: {exc}"
+                    else:
+                        with self._condition:
+                            previous = self._latest
+                            if (
+                                previous is None
+                                or ack.stream_id != previous.stream_id
+                                or ack.sequence > previous.sequence
+                            ):
+                                self._latest = ack
+                                self._valid_acks += 1
+                                self._last_error = None
+                                self._condition.notify_all()
+            except Exception as exc:
+                self._read_errors += 1
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                self._disconnect()
+                self._next_connect_time = float(self._clock()) + float(
+                    self.config.reconnect_interval_seconds
+                )
+            self._stop_event.wait(float(self.config.poll_interval_seconds))
+
+    def status(self) -> dict[str, Any]:
+        with self._condition:
+            ack = self._latest
+        return {
+            "connected": self._connection is not None,
+            "thread_alive": self.is_alive,
+            "key": self.config.key,
+            "connect_attempts": int(self._connect_attempts),
+            "valid_acks": int(self._valid_acks),
+            "decode_errors": int(self._decode_errors),
+            "read_errors": int(self._read_errors),
+            "last_error": self._last_error,
+            "latest_stream_id": None if ack is None else int(ack.stream_id),
+            "latest_sequence": None if ack is None else int(ack.sequence),
+            "latest_command_revision": (
+                None if ack is None else int(ack.command_revision)
+            ),
+        }
+
+    def close(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            timeout = float(self.config.socket_timeout_seconds) + 1.0
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                raise RuntimeError("Redis trajectory ACK reader thread did not stop")
+        self._thread = None
+        self._disconnect()

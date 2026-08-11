@@ -366,7 +366,27 @@ packet 大小为：
 50 Hz 发布时约为 `1.22 MB/s`，对本机 Redis 开销很小。Bridge 使用
 latest-only 后台 publisher，Redis 短暂阻塞不会阻塞 50 Hz 动作主循环。
 
-### 6.4 关节顺序
+### 6.4 GMT ACK 与音乐启动
+
+运动 key 默认为 `gmt_online_frame_bumi`，独立 ACK key 默认为
+`gmt_online_frame_bumi_ack`。第一帧音乐动作 packet 先进入 Redis；GMT 完成
+magic、CRC、四元数和关节顺序校验并接受新sequence后，写入52字节
+`trajectory_ack_v1`：
+
+```text
+magic/version/size
+stream_id
+sequence
+command_revision
+plan_id
+gmt_received_unix_ns
+```
+
+OMG后台读取ACK，只有 stream ID、command revision 一致且ACK sequence不早于
+第一条音乐packet时，才启动ffplay并建立音乐执行时钟。默认每5 ms轮询ACK，
+等待上限2秒；超时后fail-closed切换固定站立，不会在GMT尚未接收动作时播放。
+
+### 6.5 关节顺序
 
 - OMG 顺序来自 `assets/robots/bumi/bumi_kinematics.json`。
 - GMT 顺序来自 policy ONNX `joint_names`。
@@ -716,6 +736,9 @@ python -m omg.cli.realtime.command_client status
 | `--redis-port` | `6379` | 是 | Redis port |
 | `--redis-db` | `0` | 是 | Redis DB |
 | `--redis-key` | `gmt_online_frame_bumi` | 是 | GMT motion key |
+| `--redis-ack-key` | `<redis-key>_ack` | 是 | GMT接收确认key |
+| `--redis-ack-poll-ms` | `5` | 是 | OMG轮询ACK间隔 |
+| `--audio-ack-timeout-ms` | `2000` | 是 | 音乐首帧等待GMT确认上限；超时回站 |
 | `--redis-ttl-ms` | `500` | 是 | packet TTL |
 | `--tracker-fps` | `50` | 是 | Bridge/Redis 参考帧率 |
 | `--history-fps` | `30` | 是 | Planner history 帧率 |

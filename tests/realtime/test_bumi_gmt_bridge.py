@@ -16,7 +16,11 @@ from omg.realtime.bumi_motion_mux import (
     BumiTrajectoryHistory,
 )
 from omg.realtime.dynamic_condition import DynamicConditionController
-from omg.realtime.gmt_trajectory import GmtTrajectoryPacket, joint_order_sha256
+from omg.realtime.gmt_trajectory import (
+    GmtTrajectoryAck,
+    GmtTrajectoryPacket,
+    joint_order_sha256,
+)
 from omg.realtime.protocol import MotionPlanChunk
 
 
@@ -58,6 +62,7 @@ class _Publisher:
 
 class _AudioPlayer:
     def __init__(self) -> None:
+        self.enabled = True
         self.command_id = None
         self.starts = []
         self.stops = []
@@ -79,10 +84,24 @@ class _AudioPlayer:
         self.stop(reason="closed")
 
 
+class _AckReader:
+    def __init__(self) -> None:
+        self.ack = None
+
+    def latest_ack(self):
+        return self.ack
+
+    def status(self):
+        return {
+            "latest_sequence": None if self.ack is None else self.ack.sequence,
+        }
+
+
 def _runtime(
     controller: DynamicConditionController,
     *,
     planner: _Planner | None = None,
+    ack_reader=None,
 ):
     idle = _idle()
     planner = planner or _Planner()
@@ -112,6 +131,7 @@ def _runtime(
         native_to_gmt=np.arange(21),
         joint_order_hash=joint_order_sha256([f"j{i}" for i in range(21)]),
         audio_player=player,  # type: ignore[arg-type]
+        ack_reader=ack_reader,
         clock=lambda: runtime.cursor / 50.0 if "runtime" in locals() else 0.0,
         stream_id=10,
     )
@@ -204,6 +224,53 @@ def test_audio_clock_and_playback_start_on_first_generated_tick_then_end_idle(
         for request in planner.requests
     )
     assert "audio_ended" in player.stops
+    runtime.close()
+
+
+def test_audio_packet_is_published_before_matching_gmt_ack_starts_playback(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ack.wav"
+    wavfile.write(path, 100, np.zeros((100,), dtype=np.int16))
+    controller = DynamicConditionController(tracker_fps=50.0)
+    ack_reader = _AckReader()
+    runtime, planner, publisher, player = _runtime(
+        controller, ack_reader=ack_reader
+    )
+    controller.accept_audio(str(path))
+    runtime.step()
+    planner.responses.append(_response(planner.requests[0]))
+
+    first_motion = runtime.step()
+    assert first_motion.source == "generated"
+    assert len(publisher.packets) == 2
+    first_audio_packet = publisher.packets[-1]
+    assert player.starts == []
+    assert controller.snapshot().audio_start_tracker_frame is None
+    assert runtime.status()["audio_ack_pending"] is True
+
+    ack_reader.ack = GmtTrajectoryAck(
+        stream_id=999,
+        sequence=first_audio_packet.sequence,
+        command_revision=controller.current_revision,
+        plan_id=first_audio_packet.plan_id,
+        received_unix_ns=1,
+    )
+    runtime.step()
+    assert player.starts == []
+
+    ack_reader.ack = GmtTrajectoryAck(
+        stream_id=10,
+        sequence=first_audio_packet.sequence,
+        command_revision=controller.current_revision,
+        plan_id=first_audio_packet.plan_id,
+        received_unix_ns=2,
+    )
+    ack_tick = runtime.cursor
+    runtime.step()
+    assert player.starts[0][2] == ack_tick
+    assert controller.snapshot().audio_start_tracker_frame == ack_tick
+    assert runtime.status()["audio_ack_pending"] is False
     runtime.close()
 
 

@@ -62,6 +62,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--redis-port", type=int, default=6379)
     parser.add_argument("--redis-db", type=int, default=0)
     parser.add_argument("--redis-key", default="gmt_online_frame_bumi")
+    parser.add_argument(
+        "--redis-ack-key",
+        default=None,
+        help="GMT trajectory ACK key (default: <redis-key>_ack)",
+    )
+    parser.add_argument("--redis-ack-poll-ms", type=float, default=5.0)
+    parser.add_argument("--audio-ack-timeout-ms", type=float, default=2000.0)
     parser.add_argument("--redis-ttl-ms", type=_positive_int, default=500)
     parser.add_argument("--tracker-fps", type=float, default=50.0)
     parser.add_argument("--history-fps", type=float, default=30.0)
@@ -155,6 +162,10 @@ def _bridge_command(args: argparse.Namespace, connect: str) -> list[str]:
         str(args.redis_db),
         "--redis-key",
         str(args.redis_key),
+        "--redis-ack-poll-ms",
+        str(args.redis_ack_poll_ms),
+        "--audio-ack-timeout-ms",
+        str(args.audio_ack_timeout_ms),
         "--redis-ttl-ms",
         str(args.redis_ttl_ms),
         "--ffplay",
@@ -165,6 +176,7 @@ def _bridge_command(args: argparse.Namespace, connect: str) -> list[str]:
         "--condition-audio-step-frames",
         args.condition_audio_step_frames,
     )
+    _append_option(command, "--redis-ack-key", args.redis_ack_key)
     _append_option(command, "--status-jsonl", args.status_jsonl)
     _append_option(command, "--output", args.output)
     if args.play_audio:

@@ -8,6 +8,7 @@ from omg.realtime.gmt_trajectory import (
     TRAJECTORY_CURRENT_INDEX,
     TRAJECTORY_FRAME_COUNT,
     GmtPolicyContract,
+    GmtTrajectoryAck,
     GmtTrajectoryPacket,
     build_policy_default_idle_qpos,
     joint_order_sha256,
@@ -22,6 +23,20 @@ def _qpos(x: float = 0.0) -> np.ndarray:
     value[2] = 0.5
     value[3] = 1.0
     return value
+
+
+def test_trajectory_ack_v1_roundtrip_and_rejects_wrong_size() -> None:
+    ack = GmtTrajectoryAck(
+        stream_id=12,
+        sequence=34,
+        command_revision=5,
+        plan_id=6,
+        received_unix_ns=7,
+    )
+    decoded = GmtTrajectoryAck.decode(ack.encode())
+    assert decoded == ack
+    with pytest.raises(ValueError, match="must contain"):
+        GmtTrajectoryAck.decode(ack.encode()[:-1])
 
 
 def test_trajectory_v1_roundtrip_crc_and_exact_temporal_layout() -> None:
