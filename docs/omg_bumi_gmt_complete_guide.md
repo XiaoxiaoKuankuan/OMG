@@ -240,8 +240,25 @@ root quaternion wxyz    4
 BUMI joint position    21
 ```
 
-Bridge 从 50 Hz 实际执行参考中按时间采样出 30 Hz 的 10 帧。因此上一次
-混合、回站或旧 plan 的真实输出都会进入下一次规划历史。
+`--history-source reference` 是默认值。Bridge 从自己实际发布的 50 Hz 参考中
+按时间采样出 30 Hz 的 10 帧，因此上一次混合、回站或旧 plan 的输出都会进入
+下一次规划历史，不依赖 GMT 反馈。
+
+`--history-source lowstate` 用于闭环历史。GMT 以 50 Hz 把 IMU 根四元数和
+LowState 21 个实测关节角写到 `gmt_online_frame_bumi_lowstate`；OMG 按 policy
+joint names 重排为 BUMI 原生顺序，再组成：
+
+```text
+root xyz             当前 OMG reference trajectory
+root quaternion      GMT IMU / LowState
+joint position       GMT LowState
+```
+
+全局 root xyz 不由 LowState 提供，也不通过关节积分猜测。融合后的 50 Hz 序列
+继续由同一个时间采样器转成严格的 10 帧 @ 30 Hz。启动或反馈中断后，必须先积累
+覆盖该时间窗的至少 16 个 50 Hz tick 且至少 10 个不同 LowState sample，才允许
+发起新规划；反馈超过默认 200 ms 未更新时不会静默回退到 reference history。
+当前动作缓冲仍正常执行，耗尽后回固定站立。
 
 Planner 使用 BUMI representation/kinematics 把 qpos 编码为：
 
@@ -640,6 +657,18 @@ python -m omg.cli.realtime.bumi_gmt_runtime \
   --status-jsonl outputs_realtime/bumi_gmt/status.jsonl
 ```
 
+上面使用默认 `--history-source reference`。若希望规划历史主要来自 Gazebo/实机
+LowState，在终端 1 命令中增加：
+
+```bash
+  --history-source lowstate \
+  --redis-lowstate-key gmt_online_frame_bumi_lowstate \
+  --lowstate-max-age-ms 200
+```
+
+此模式要先启动 GMT 并进入现有 GMT 安全激活状态；否则没有 LowState feedback，
+OMG 会继续发送固定站立但不会开始 diffusion 规划。
+
 参考动作网页：
 
 ```text
@@ -748,6 +777,10 @@ python -m omg.cli.realtime.command_client status
 | `--tracker-fps` | `50` | 是 | Bridge/Redis 参考帧率 |
 | `--history-fps` | `30` | 是 | Planner history 帧率 |
 | `--history-frames` | `10` | 是 | Planner 历史帧数 |
+| `--history-source` | `reference` | 是 | `reference` 使用已发布参考；`lowstate` 融合实测姿态 |
+| `--redis-lowstate-key` | `<redis-key>_lowstate` | 是 | GMT→OMG LowState feedback key |
+| `--redis-lowstate-poll-ms` | `5` | 是 | OMG 后台轮询 LowState key 的间隔 |
+| `--lowstate-max-age-ms` | `200` | 是 | LowState 超过此年龄即暂停新规划 |
 | `--planner-frames` | `60` | 是 | Planner 每次输出帧数 |
 | `--replan-remaining-frames` | `60` | 是 | 还剩 60×50Hz 帧时规划 |
 | `--condition-audio-step-frames` | 自动，当前为 `24` | 是 | 每次 replan 的音频时间轴步长 |

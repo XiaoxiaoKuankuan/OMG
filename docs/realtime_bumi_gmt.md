@@ -14,6 +14,12 @@ BUMI ONNX Planner → BUMI realtime bridge → Redis trajectory_v1 → GMT → G
 Planner、ONNX 和 T5 在终端 1 中常驻。终端 2 仍只执行 GMT 原来的
 `./simulation.sh`。终端 3 可以反复发送文本、WAV 或 `stand`。
 
+Planner 历史来源可选。默认 `--history-source reference` 延续现有行为，10 帧
+history 来自 Bridge 已发布的参考。增加 `--history-source lowstate` 后，10 帧
+history 的根四元数和 21 个关节角来自 GMT 的真实 LowState，只有全局 root xyz
+逐 tick 从当前 reference trajectory 补入。该模式使用独立 Redis key
+`gmt_online_frame_bumi_lowstate`，不会改变 GMT motion 输入 key。
+
 ## 固定站立语义
 
 启动、无命令、`stand`、音乐自然结束以及 Planner 错误都使用固定 BUMI
@@ -90,6 +96,18 @@ python -m omg.cli.realtime.bumi_gmt_runtime \
   --continuous \
   --status-jsonl outputs_realtime/bumi_gmt/status.jsonl
 ```
+
+上面使用默认的 reference history。如需 LowState history，在终端 1 增加：
+
+```bash
+  --history-source lowstate \
+  --redis-lowstate-key gmt_online_frame_bumi_lowstate \
+  --lowstate-max-age-ms 200
+```
+
+GMT 以 50 Hz 发布实测反馈，OMG 融合后重采样为 10 帧 @ 30 Hz。首次规划前会
+等待完整实测时间窗；反馈断流时暂停新规划且不自动退回 reference history，已有
+计划仍连续执行，之后平滑回固定站立。默认模式不创建 LowState Redis 读取线程。
 
 如不需要电脑音响播放音乐，删除 `--play-audio`。指定该参数时必须存在
 `/usr/bin/ffplay`。声音从运行终端 1 的主机默认音频设备输出。

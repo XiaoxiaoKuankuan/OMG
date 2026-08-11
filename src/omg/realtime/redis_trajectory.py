@@ -8,7 +8,11 @@ from typing import Any, Callable, Protocol
 
 import numpy as np
 
-from omg.realtime.gmt_trajectory import GmtTrajectoryAck, GmtTrajectoryPacket
+from omg.realtime.gmt_trajectory import (
+    GmtLowStateFeedback,
+    GmtTrajectoryAck,
+    GmtTrajectoryPacket,
+)
 
 
 @dataclass(frozen=True)
@@ -498,5 +502,222 @@ class RedisTrajectoryAckReader:
             thread.join(timeout=timeout)
             if thread.is_alive():
                 raise RuntimeError("Redis trajectory ACK reader thread did not stop")
+        self._thread = None
+        self._disconnect()
+
+
+@dataclass(frozen=True)
+class RedisLowStateFeedbackReaderConfig:
+    host: str = "127.0.0.1"
+    port: int = 6379
+    db: int = 0
+    key: str = "gmt_online_frame_bumi_lowstate"
+    poll_interval_seconds: float = 0.005
+    connect_timeout_seconds: float = 0.5
+    socket_timeout_seconds: float = 0.5
+    reconnect_interval_seconds: float = 0.25
+    verbose: bool = True
+
+    def __post_init__(self) -> None:
+        if not str(self.host).strip():
+            raise ValueError("Redis LowState host must be non-empty")
+        if not 1 <= int(self.port) <= 65535:
+            raise ValueError("Redis LowState port must be in [1,65535]")
+        if int(self.db) < 0:
+            raise ValueError("Redis LowState db must be non-negative")
+        if not str(self.key):
+            raise ValueError("Redis LowState key must be non-empty")
+        for name, value in (
+            ("poll_interval_seconds", self.poll_interval_seconds),
+            ("connect_timeout_seconds", self.connect_timeout_seconds),
+            ("socket_timeout_seconds", self.socket_timeout_seconds),
+        ):
+            if not np.isfinite(float(value)) or float(value) <= 0.0:
+                raise ValueError(f"{name} must be positive and finite")
+        if (
+            not np.isfinite(float(self.reconnect_interval_seconds))
+            or float(self.reconnect_interval_seconds) < 0.0
+        ):
+            raise ValueError("reconnect_interval_seconds must be non-negative and finite")
+
+
+class RedisLowStateFeedbackReader:
+    """Read GMT LowState feedback without blocking the bridge's 50 Hz loop.
+
+    A repeated value at the Redis key does not refresh its receive timestamp.
+    This is important: if GMT stops publishing while Redis still contains the
+    last packet, the OMG runtime must detect a stale sensor stream.
+    """
+
+    def __init__(
+        self,
+        config: RedisLowStateFeedbackReaderConfig | None = None,
+        *,
+        connection_factory: Callable[
+            [RedisTrajectoryPublisherConfig], _BinaryRedisConnection
+        ]
+        | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.config = config or RedisLowStateFeedbackReaderConfig()
+        self._factory = connection_factory or RespBinaryRedisConnection
+        self._clock = clock
+        self._condition = threading.Condition()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._latest: GmtLowStateFeedback | None = None
+        self._latest_received_time: float | None = None
+        self._latest_identity: tuple[int, int] | None = None
+        self._connection: _BinaryRedisConnection | None = None
+        self._next_connect_time = float("-inf")
+        self._connect_attempts = 0
+        self._valid_samples = 0
+        self._decode_errors = 0
+        self._read_errors = 0
+        self._last_error: str | None = None
+
+    @property
+    def is_alive(self) -> bool:
+        return bool(self._thread is not None and self._thread.is_alive())
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("Redis LowState feedback reader already started")
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="omg-bumi-redis-lowstate-reader",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def latest_feedback(
+        self, *, max_age_seconds: float | None = None
+    ) -> GmtLowStateFeedback | None:
+        with self._condition:
+            sample = self._latest
+            received = self._latest_received_time
+        if sample is None or received is None:
+            return None
+        if max_age_seconds is not None:
+            maximum = float(max_age_seconds)
+            if not np.isfinite(maximum) or maximum <= 0.0:
+                raise ValueError("max_age_seconds must be positive and finite")
+            if float(self._clock()) - received > maximum:
+                return None
+        return sample
+
+    def age_seconds(self) -> float | None:
+        with self._condition:
+            received = self._latest_received_time
+        if received is None:
+            return None
+        return max(0.0, float(self._clock()) - received)
+
+    def _connection_config(self) -> RedisTrajectoryPublisherConfig:
+        return RedisTrajectoryPublisherConfig(
+            host=self.config.host,
+            port=self.config.port,
+            db=self.config.db,
+            key=self.config.key,
+            ttl_ms=1000,
+            connect_timeout_seconds=self.config.connect_timeout_seconds,
+            socket_timeout_seconds=self.config.socket_timeout_seconds,
+            reconnect_interval_seconds=self.config.reconnect_interval_seconds,
+            verbose=False,
+        )
+
+    def _disconnect(self) -> None:
+        connection, self._connection = self._connection, None
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+    def _ensure_connection(self) -> bool:
+        if self._connection is not None:
+            return True
+        now = float(self._clock())
+        if now < self._next_connect_time:
+            return False
+        self._connect_attempts += 1
+        try:
+            self._connection = self._factory(self._connection_config())
+            self._last_error = None
+            if self.config.verbose:
+                print(
+                    f"[OMG BUMI LowState] connected {self.config.host}:"
+                    f"{self.config.port}/{self.config.db} key={self.config.key}",
+                    flush=True,
+                )
+            return True
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self._next_connect_time = now + float(
+                self.config.reconnect_interval_seconds
+            )
+            return False
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            if not self._ensure_connection():
+                self._stop_event.wait(float(self.config.poll_interval_seconds))
+                continue
+            try:
+                assert self._connection is not None
+                payload = self._connection.get_bytes(str(self.config.key))
+                if payload is not None:
+                    try:
+                        sample = GmtLowStateFeedback.decode(payload)
+                    except Exception as exc:
+                        self._decode_errors += 1
+                        self._last_error = f"{type(exc).__name__}: {exc}"
+                    else:
+                        identity = (sample.sequence, sample.captured_unix_ns)
+                        with self._condition:
+                            if identity != self._latest_identity:
+                                self._latest = sample
+                                self._latest_identity = identity
+                                self._latest_received_time = float(self._clock())
+                                self._valid_samples += 1
+                                self._last_error = None
+                                self._condition.notify_all()
+            except Exception as exc:
+                self._read_errors += 1
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                self._disconnect()
+                self._next_connect_time = float(self._clock()) + float(
+                    self.config.reconnect_interval_seconds
+                )
+            self._stop_event.wait(float(self.config.poll_interval_seconds))
+
+    def status(self) -> dict[str, Any]:
+        with self._condition:
+            sample = self._latest
+        return {
+            "connected": self._connection is not None,
+            "thread_alive": self.is_alive,
+            "key": self.config.key,
+            "connect_attempts": int(self._connect_attempts),
+            "valid_samples": int(self._valid_samples),
+            "decode_errors": int(self._decode_errors),
+            "read_errors": int(self._read_errors),
+            "last_error": self._last_error,
+            "latest_sequence": None if sample is None else int(sample.sequence),
+            "latest_captured_unix_ns": (
+                None if sample is None else int(sample.captured_unix_ns)
+            ),
+            "age_seconds": self.age_seconds(),
+        }
+
+    def close(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            timeout = float(self.config.socket_timeout_seconds) + 1.0
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                raise RuntimeError("Redis LowState feedback reader thread did not stop")
         self._thread = None
         self._disconnect()

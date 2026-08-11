@@ -390,11 +390,18 @@ class BumiTrackerExecutionHistory:
                 / self.history_fps
             )
         ) + 1
+        self.required_tracker_frames = required
         self._max_tracker_frames = max(2, required + 2)
         initial = coerce_bumi_qpos_motion(initial_qpos, name="initial_qpos")
         self._frames = [frame.copy() for frame in initial[-self._max_tracker_frames :]]
         while len(self._frames) < self._max_tracker_frames:
             self._frames.insert(0, self._frames[0].copy())
+
+    def reset(self, qpos: np.ndarray) -> None:
+        """Reset the timestamp history without carrying samples across a gap."""
+
+        frame = coerce_bumi_qpos_frame(qpos)
+        self._frames = [frame.copy() for _ in range(self._max_tracker_frames)]
 
     def append(self, qpos: np.ndarray) -> None:
         self._frames.append(coerce_bumi_qpos_frame(qpos))

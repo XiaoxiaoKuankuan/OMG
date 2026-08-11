@@ -69,10 +69,36 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--redis-ack-poll-ms", type=float, default=5.0)
     parser.add_argument("--audio-ack-timeout-ms", type=float, default=2000.0)
+    parser.add_argument(
+        "--redis-lowstate-key",
+        default=None,
+        help="GMT LowState feedback key (default: <redis-key>_lowstate)",
+    )
+    parser.add_argument(
+        "--redis-lowstate-poll-ms",
+        type=float,
+        default=5.0,
+        help="Background LowState Redis polling interval",
+    )
+    parser.add_argument(
+        "--lowstate-max-age-ms",
+        type=float,
+        default=200.0,
+        help="Pause new replans when measured feedback is older than this",
+    )
     parser.add_argument("--redis-ttl-ms", type=_positive_int, default=500)
     parser.add_argument("--tracker-fps", type=float, default=50.0)
     parser.add_argument("--history-fps", type=float, default=30.0)
     parser.add_argument("--history-frames", type=_positive_int, default=10)
+    parser.add_argument(
+        "--history-source",
+        choices=["reference", "lowstate"],
+        default="reference",
+        help=(
+            "Planner history source; lowstate fuses measured IMU/joints with "
+            "root xyz from the emitted reference"
+        ),
+    )
     parser.add_argument("--planner-frames", type=_positive_int, default=60)
     parser.add_argument("--replan-remaining-frames", type=int, default=60)
     parser.add_argument(
@@ -159,6 +185,8 @@ def _bridge_command(args: argparse.Namespace, connect: str) -> list[str]:
         str(args.history_fps),
         "--history-frames",
         str(args.history_frames),
+        "--history-source",
+        str(args.history_source),
         "--planner-frames",
         str(args.planner_frames),
         "--replan-remaining-frames",
@@ -181,6 +209,10 @@ def _bridge_command(args: argparse.Namespace, connect: str) -> list[str]:
         str(args.redis_ack_poll_ms),
         "--audio-ack-timeout-ms",
         str(args.audio_ack_timeout_ms),
+        "--redis-lowstate-poll-ms",
+        str(args.redis_lowstate_poll_ms),
+        "--lowstate-max-age-ms",
+        str(args.lowstate_max_age_ms),
         "--redis-ttl-ms",
         str(args.redis_ttl_ms),
         "--ffplay",
@@ -192,6 +224,7 @@ def _bridge_command(args: argparse.Namespace, connect: str) -> list[str]:
         args.condition_audio_step_frames,
     )
     _append_option(command, "--redis-ack-key", args.redis_ack_key)
+    _append_option(command, "--redis-lowstate-key", args.redis_lowstate_key)
     _append_option(command, "--status-jsonl", args.status_jsonl)
     _append_option(command, "--output", args.output)
     if args.play_audio:

@@ -39,6 +39,13 @@ TRAJECTORY_ACK_VERSION = 1
 TRAJECTORY_ACK_FORMAT = "<8sHHQQqqQ"
 TRAJECTORY_ACK_SIZE = struct.calcsize(TRAJECTORY_ACK_FORMAT)
 
+LOWSTATE_MAGIC = b"OMGBLS01"
+LOWSTATE_VERSION = 1
+LOWSTATE_HEADER_FORMAT = "<8sHHIQQHH32sI"
+LOWSTATE_HEADER_SIZE = struct.calcsize(LOWSTATE_HEADER_FORMAT)
+LOWSTATE_JOINT_COUNT = TRAJECTORY_JOINT_COUNT
+LOWSTATE_PAYLOAD_DIM = 4 + LOWSTATE_JOINT_COUNT
+
 FLAG_FIXED_IDLE = 1 << 0
 FLAG_TRANSITION = 1 << 1
 FLAG_TEXT = 1 << 2
@@ -97,6 +104,106 @@ class GmtTrajectoryAck:
             command_revision=int(command_revision),
             plan_id=int(plan_id),
             received_unix_ns=int(received_unix_ns),
+        )
+
+
+@dataclass(frozen=True)
+class GmtLowStateFeedback:
+    """A GMT LowState sample in GMT policy joint order.
+
+    The packet deliberately omits root translation: the robot LowState/IMU
+    does not provide a reliable global root position.  The OMG bridge fuses
+    ``root_quat_wxyz`` and ``joint_pos`` with root xyz from the reference
+    trajectory at the same 50 Hz bridge tick.
+    """
+
+    sequence: int
+    captured_unix_ns: int
+    joint_order_hash: bytes
+    root_quat_wxyz: np.ndarray
+    joint_pos: np.ndarray
+    flags: int = 0
+
+    def encode(self) -> bytes:
+        quat = np.asarray(self.root_quat_wxyz, dtype=np.float32).reshape(-1)
+        joints = np.asarray(self.joint_pos, dtype=np.float32).reshape(-1)
+        if quat.shape != (4,):
+            raise ValueError(f"root_quat_wxyz must have shape (4,), got {quat.shape}")
+        if joints.shape != (LOWSTATE_JOINT_COUNT,):
+            raise ValueError(
+                f"joint_pos must have shape ({LOWSTATE_JOINT_COUNT},), got {joints.shape}"
+            )
+        if not np.isfinite(quat).all() or not np.isfinite(joints).all():
+            raise ValueError("LowState feedback contains non-finite values")
+        norm = float(np.linalg.norm(quat))
+        if not np.isfinite(norm) or norm < 0.5 or norm > 1.5:
+            raise ValueError(f"LowState root quaternion norm is invalid: {norm}")
+        quat = quat / np.float32(norm)
+        order_hash = bytes(self.joint_order_hash)
+        if len(order_hash) != 32:
+            raise ValueError("joint_order_hash must contain 32 SHA256 bytes")
+        payload_array = np.concatenate((quat, joints)).astype("<f4", copy=False)
+        payload = payload_array.tobytes(order="C")
+        payload_crc = zlib.crc32(payload) & 0xFFFFFFFF
+        header = struct.pack(
+            LOWSTATE_HEADER_FORMAT,
+            LOWSTATE_MAGIC,
+            LOWSTATE_VERSION,
+            LOWSTATE_HEADER_SIZE,
+            int(self.flags),
+            int(self.sequence),
+            int(self.captured_unix_ns),
+            LOWSTATE_JOINT_COUNT,
+            LOWSTATE_PAYLOAD_DIM,
+            order_hash,
+            payload_crc,
+        )
+        return header + payload
+
+    @classmethod
+    def decode(cls, blob: bytes | bytearray | memoryview) -> "GmtLowStateFeedback":
+        value = bytes(blob)
+        expected_size = LOWSTATE_HEADER_SIZE + LOWSTATE_PAYLOAD_DIM * 4
+        if len(value) != expected_size:
+            raise ValueError(
+                f"LowState feedback must contain {expected_size} bytes, got {len(value)}"
+            )
+        (
+            magic,
+            version,
+            header_size,
+            flags,
+            sequence,
+            captured_unix_ns,
+            joint_count,
+            payload_dim,
+            order_hash,
+            payload_crc,
+        ) = struct.unpack(LOWSTATE_HEADER_FORMAT, value[:LOWSTATE_HEADER_SIZE])
+        if magic != LOWSTATE_MAGIC or version != LOWSTATE_VERSION:
+            raise ValueError("unsupported GMT LowState feedback magic/version")
+        if header_size != LOWSTATE_HEADER_SIZE:
+            raise ValueError(f"unsupported GMT LowState header size {header_size}")
+        if joint_count != LOWSTATE_JOINT_COUNT or payload_dim != LOWSTATE_PAYLOAD_DIM:
+            raise ValueError("unexpected GMT LowState joint count or payload dimension")
+        payload = value[header_size:]
+        if (zlib.crc32(payload) & 0xFFFFFFFF) != payload_crc:
+            raise ValueError("GMT LowState payload CRC32 mismatch")
+        values = np.frombuffer(payload, dtype="<f4").copy()
+        if not np.isfinite(values).all():
+            raise ValueError("GMT LowState feedback contains non-finite values")
+        quat = values[:4]
+        norm = float(np.linalg.norm(quat))
+        if not np.isfinite(norm) or norm < 0.5 or norm > 1.5:
+            raise ValueError(f"GMT LowState root quaternion norm is invalid: {norm}")
+        quat /= np.float32(norm)
+        return cls(
+            sequence=int(sequence),
+            captured_unix_ns=int(captured_unix_ns),
+            joint_order_hash=bytes(order_hash),
+            root_quat_wxyz=quat,
+            joint_pos=values[4:],
+            flags=int(flags),
         )
 
 

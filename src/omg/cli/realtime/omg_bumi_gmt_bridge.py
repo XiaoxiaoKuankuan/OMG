@@ -31,6 +31,7 @@ from omg.realtime.gmt_trajectory import (
     FLAG_TEXT,
     FLAG_TRANSITION,
     TRAJECTORY_FRAME_COUNT,
+    GmtLowStateFeedback,
     GmtTrajectoryAck,
     GmtPolicyContract,
     build_policy_default_idle_qpos,
@@ -39,6 +40,8 @@ from omg.realtime.gmt_trajectory import (
 from omg.realtime.protocol import MotionPlanChunk, RobotStateRequest
 from omg.realtime.redis_trajectory import (
     AsyncRedisTrajectoryPublisher,
+    RedisLowStateFeedbackReader,
+    RedisLowStateFeedbackReaderConfig,
     RedisTrajectoryAckReader,
     RedisTrajectoryAckReaderConfig,
     RedisTrajectoryPublisher,
@@ -62,6 +65,8 @@ class BumiGmtRuntimeConfig:
     request_timeout_ms: int = 120000
     audio_ack_timeout_seconds: float = 2.0
     status_interval_seconds: float = 1.0
+    history_source: str = "reference"
+    lowstate_max_age_seconds: float = 0.2
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -70,6 +75,7 @@ class BumiGmtRuntimeConfig:
             ("audio_fps", self.audio_fps),
             ("status_interval_seconds", self.status_interval_seconds),
             ("audio_ack_timeout_seconds", self.audio_ack_timeout_seconds),
+            ("lowstate_max_age_seconds", self.lowstate_max_age_seconds),
         ):
             if not np.isfinite(float(value)) or float(value) <= 0.0:
                 raise ValueError(f"{name} must be positive and finite")
@@ -81,6 +87,10 @@ class BumiGmtRuntimeConfig:
             raise ValueError("condition_audio_step_frames must be positive")
         if int(self.request_timeout_ms) <= 0:
             raise ValueError("request_timeout_ms must be positive")
+        if self.history_source not in {"reference", "lowstate"}:
+            raise ValueError(
+                "history_source must be either 'reference' or 'lowstate'"
+            )
 
 
 @dataclass(frozen=True)
@@ -117,6 +127,8 @@ class BumiGmtRuntime:
         joint_order_hash: bytes,
         audio_player: SynchronizedAudioPlayer,
         ack_reader: Any | None = None,
+        lowstate_history: BumiTrackerExecutionHistory | None = None,
+        lowstate_reader: Any | None = None,
         sim_stream: Any | None = None,
         status_callback: Callable[[dict[str, Any]], None] | None = None,
         planner_client_factory: Callable[[], Any] | None = None,
@@ -134,6 +146,14 @@ class BumiGmtRuntime:
         self.joint_order_hash = bytes(joint_order_hash)
         self.audio_player = audio_player
         self.ack_reader = ack_reader
+        self.lowstate_history = lowstate_history
+        self.lowstate_reader = lowstate_reader
+        if self.config.history_source == "lowstate" and (
+            self.lowstate_history is None or self.lowstate_reader is None
+        ):
+            raise ValueError(
+                "history_source=lowstate requires a LowState reader and history buffer"
+            )
         self.sim_stream = sim_stream
         self.status_callback = status_callback
         self.planner_client_factory = planner_client_factory
@@ -155,10 +175,146 @@ class BumiGmtRuntime:
         self._planner_error_count = 0
         self._failed_command_revision: int | None = None
         self._pending_audio_ack: PendingAudioAck | None = None
+        self._lowstate_stream_fresh = False
+        self._lowstate_valid_tracker_frames = 0
+        self._lowstate_unique_samples = 0
+        self._last_lowstate_identity: tuple[int, int] | None = None
+        self._lowstate_rejection_reason: str | None = None
+        self._lowstate_ready_announced = False
 
     def _emit(self, event: dict[str, Any]) -> None:
         if self.status_callback is not None:
             self.status_callback(dict(event))
+
+    def _lowstate_history_ready(self) -> bool:
+        if self.config.history_source != "lowstate":
+            return True
+        assert self.lowstate_history is not None
+        return bool(
+            self._lowstate_stream_fresh
+            and self._lowstate_valid_tracker_frames
+            >= int(self.lowstate_history.required_tracker_frames)
+            and self._lowstate_unique_samples >= int(self.config.history_frames)
+        )
+
+    def _planner_history_for_replan(self) -> np.ndarray | None:
+        if self.config.history_source == "reference":
+            return self.planner_history.planner_history()
+        if not self._lowstate_history_ready():
+            return None
+        assert self.lowstate_history is not None
+        return self.lowstate_history.planner_history()
+
+    def _invalidate_lowstate_history(
+        self, *, reason: str, reference_qpos: np.ndarray
+    ) -> None:
+        was_fresh = self._lowstate_stream_fresh
+        self._lowstate_stream_fresh = False
+        self._lowstate_valid_tracker_frames = 0
+        self._lowstate_unique_samples = 0
+        self._last_lowstate_identity = None
+        self._lowstate_rejection_reason = reason
+        self._lowstate_ready_announced = False
+        if self.lowstate_history is not None:
+            self.lowstate_history.reset(reference_qpos)
+        if was_fresh:
+            print(
+                f"[BUMI history] LowState unavailable ({reason}); "
+                "pausing new replans until 10 measured history frames are ready",
+                flush=True,
+            )
+            self._emit(
+                {
+                    "kind": "lowstate_history_unavailable",
+                    "tracker_frame": self.cursor,
+                    "reason": reason,
+                }
+            )
+
+    def _append_history_sample(self, reference_qpos: np.ndarray) -> None:
+        """Append reference history and, when selected, a fused LowState pose."""
+
+        self.planner_history.append(reference_qpos)
+        if self.config.history_source != "lowstate":
+            return
+        assert self.lowstate_reader is not None
+        assert self.lowstate_history is not None
+        sample: GmtLowStateFeedback | None = self.lowstate_reader.latest_feedback(
+            max_age_seconds=float(self.config.lowstate_max_age_seconds)
+        )
+        if sample is None:
+            self._invalidate_lowstate_history(
+                reason="missing_or_stale", reference_qpos=reference_qpos
+            )
+            return
+        if bytes(sample.joint_order_hash) != self.joint_order_hash:
+            self._invalidate_lowstate_history(
+                reason="joint_order_hash_mismatch", reference_qpos=reference_qpos
+            )
+            return
+
+        fused = np.asarray(reference_qpos, dtype=np.float32).copy()
+        # root xyz stays exactly on the current reference trajectory.  LowState
+        # supplies the observable root orientation and the measured joints.
+        fused[3:7] = np.asarray(sample.root_quat_wxyz, dtype=np.float32)
+        measured_native = np.empty((21,), dtype=np.float32)
+        measured_native[self.native_to_gmt] = np.asarray(
+            sample.joint_pos, dtype=np.float32
+        )
+        fused[7:] = measured_native
+
+        if not self._lowstate_stream_fresh:
+            self.lowstate_history.reset(fused)
+        identity = (int(sample.sequence), int(sample.captured_unix_ns))
+        if identity != self._last_lowstate_identity:
+            self._lowstate_unique_samples += 1
+            self._last_lowstate_identity = identity
+        self.lowstate_history.append(fused)
+        self._lowstate_valid_tracker_frames += 1
+        self._lowstate_stream_fresh = True
+        self._lowstate_rejection_reason = None
+        if self._lowstate_history_ready() and not self._lowstate_ready_announced:
+            self._lowstate_ready_announced = True
+            print(
+                f"[BUMI history] LowState history ready: "
+                f"{self.config.history_frames} frames @ {self.config.history_fps:g} Hz; "
+                "root xyz=reference, root quat/joints=LowState",
+                flush=True,
+            )
+            self._emit(
+                {
+                    "kind": "lowstate_history_ready",
+                    "tracker_frame": self.cursor,
+                    "valid_tracker_frames": self._lowstate_valid_tracker_frames,
+                    "unique_samples": self._lowstate_unique_samples,
+                }
+            )
+
+    def _history_status(self) -> dict[str, Any]:
+        reader_status = (
+            self.lowstate_reader.status()
+            if self.lowstate_reader is not None
+            and hasattr(self.lowstate_reader, "status")
+            else None
+        )
+        return {
+            "source": self.config.history_source,
+            "ready": self._lowstate_history_ready(),
+            "root_xyz_source": "reference",
+            "root_quaternion_source": (
+                "lowstate" if self.config.history_source == "lowstate" else "reference"
+            ),
+            "joint_position_source": self.config.history_source,
+            "valid_tracker_frames": int(self._lowstate_valid_tracker_frames),
+            "unique_lowstate_samples": int(self._lowstate_unique_samples),
+            "required_tracker_frames": (
+                None
+                if self.lowstate_history is None
+                else int(self.lowstate_history.required_tracker_frames)
+            ),
+            "rejection_reason": self._lowstate_rejection_reason,
+            "reader": reader_status,
+        }
 
     def _condition_metadata(self, snapshot: ConditionSnapshot) -> dict[str, Any]:
         metadata = snapshot.metadata(
@@ -176,6 +332,8 @@ class BumiGmtRuntime:
                 "robot_name": "bumi",
                 "state_dim": BUMI_QPOS_DIM,
                 "fixed_idle_for_stand": True,
+                "history_source": self.config.history_source,
+                "history_root_xyz_source": "reference",
                 "condition_elapsed_tracker_frames": int(
                     self.controller.audio_elapsed_tracker_frames(self.cursor)
                 ),
@@ -229,8 +387,11 @@ class BumiGmtRuntime:
         )
         if snapshot.command_type == "stand":
             return
+        planner_history = self._planner_history_for_replan()
+        if planner_history is None:
+            return
         request = RobotStateRequest(
-            qpos_36_history=self.planner_history.planner_history(),
+            qpos_36_history=planner_history,
             history_fps=float(self.config.history_fps),
             tracker_frame=self.cursor,
             buffer_remaining_frames=self.mux.plan_remaining_frames,
@@ -260,13 +421,14 @@ class BumiGmtRuntime:
                 "command_revision": snapshot.revision,
                 "condition_index": snapshot.condition_index,
                 "condition_index_committed": bool(committed),
+                "history_source": self.config.history_source,
             }
         )
         print(
             f"[BUMI→GMT replan request] frame={self.cursor} "
             f"command_id={snapshot.command_id} type={snapshot.command_type} "
             f"revision={snapshot.revision} condition_index={snapshot.condition_index} "
-            f"prompt={snapshot.condition_sequence!r}",
+            f"history={self.config.history_source} prompt={snapshot.condition_sequence!r}",
             flush=True,
         )
 
@@ -412,6 +574,8 @@ class BumiGmtRuntime:
         if self.pending is not None or snapshot.command_type == "stand":
             return False
         if self._failed_command_revision == snapshot.revision:
+            return False
+        if not self._lowstate_history_ready():
             return False
         return bool(
             self.active_plan_revision != snapshot.revision
@@ -625,6 +789,7 @@ class BumiGmtRuntime:
                 "planner_error_count": self._planner_error_count,
                 "failed_command_revision": self._failed_command_revision,
                 "stale_plan_count": self._stale_plan_count,
+                "planner_history": self._history_status(),
             }
         )
 
@@ -670,7 +835,7 @@ class BumiGmtRuntime:
         # acknowledgement for the packet that was just queued.
         self._poll_audio_ack()
         self.packet_sequence += 1
-        self.planner_history.append(tick.qpos)
+        self._append_history_sample(tick.qpos)
 
         if self.sim_stream is not None:
             playback = self.audio_player.status()
@@ -688,6 +853,10 @@ class BumiGmtRuntime:
                     f"plan id: {tick.plan_id} remaining: {tick.plan_remaining_frames}",
                     f"audio: {'playing' if playback['playing'] else 'off'}",
                     f"GMT Redis: {'queued' if redis_queued else 'not connected'}",
+                    (
+                        f"history: {self.config.history_source} "
+                        f"({'ready' if self._lowstate_history_ready() else 'waiting'})"
+                    ),
                 ],
             )
         self._periodic_status(tick, snapshot, redis_queued)
@@ -724,6 +893,7 @@ class BumiGmtRuntime:
                 self.ack_reader.status() if self.ack_reader is not None else None
             ),
             "publisher": self.publisher.status() if hasattr(self.publisher, "status") else {},
+            "planner_history": self._history_status(),
         }
 
     def close(self) -> None:
@@ -747,6 +917,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tracker-fps", type=float, default=50.0)
     parser.add_argument("--history-fps", type=float, default=30.0)
     parser.add_argument("--history-frames", type=int, default=10)
+    parser.add_argument(
+        "--history-source",
+        choices=["reference", "lowstate"],
+        default="reference",
+        help=(
+            "Planner history source. lowstate uses GMT IMU quaternion and measured "
+            "joints while retaining root xyz from the emitted reference trajectory."
+        ),
+    )
     parser.add_argument("--planner-frames", type=int, default=60)
     parser.add_argument("--replan-remaining-frames", type=int, default=60)
     parser.add_argument("--blend-seconds", type=float, default=0.2)
@@ -787,6 +966,13 @@ def _parse_args() -> argparse.Namespace:
         help="GMT trajectory ACK key (default: <redis-key>_ack)",
     )
     parser.add_argument("--redis-ack-poll-ms", type=float, default=5.0)
+    parser.add_argument(
+        "--redis-lowstate-key",
+        default=None,
+        help="GMT LowState feedback key (default: <redis-key>_lowstate)",
+    )
+    parser.add_argument("--redis-lowstate-poll-ms", type=float, default=5.0)
+    parser.add_argument("--lowstate-max-age-ms", type=float, default=200.0)
     parser.add_argument("--audio-ack-timeout-ms", type=float, default=2000.0)
     parser.add_argument("--redis-ttl-ms", type=int, default=500)
     parser.add_argument("--sim-stream-bind", default=None)
@@ -841,6 +1027,8 @@ def main() -> None:
         request_timeout_ms=args.timeout_ms,
         audio_ack_timeout_seconds=float(args.audio_ack_timeout_ms) / 1000.0,
         status_interval_seconds=args.status_interval_seconds,
+        history_source=args.history_source,
+        lowstate_max_age_seconds=float(args.lowstate_max_age_ms) / 1000.0,
     )
     controller = DynamicConditionController(
         tracker_fps=args.tracker_fps,
@@ -866,6 +1054,16 @@ def main() -> None:
         tracker_fps=args.tracker_fps,
         history_fps=args.history_fps,
         history_frames=args.history_frames,
+    )
+    lowstate_history = (
+        BumiTrackerExecutionHistory(
+            initial,
+            tracker_fps=args.tracker_fps,
+            history_fps=args.history_fps,
+            history_frames=args.history_frames,
+        )
+        if args.history_source == "lowstate"
+        else None
     )
     trajectory_history = BumiTrajectoryHistory(idle_qpos)
     planner = ZmqPlanClient(args.connect)
@@ -893,6 +1091,22 @@ def main() -> None:
         if args.play_audio
         else None
     )
+    lowstate_key = args.redis_lowstate_key or f"{args.redis_key}_lowstate"
+    lowstate_reader = (
+        RedisLowStateFeedbackReader(
+            RedisLowStateFeedbackReaderConfig(
+                host=args.redis_host,
+                port=args.redis_port,
+                db=args.redis_db,
+                key=lowstate_key,
+                poll_interval_seconds=(
+                    float(args.redis_lowstate_poll_ms) / 1000.0
+                ),
+            )
+        )
+        if args.history_source == "lowstate"
+        else None
+    )
     audio_player = SynchronizedAudioPlayer(
         enabled=args.play_audio, executable=args.ffplay
     )
@@ -905,6 +1119,8 @@ def main() -> None:
         publisher.start()
         if ack_reader is not None:
             ack_reader.start()
+        if lowstate_reader is not None:
+            lowstate_reader.start()
         if args.sim_stream_bind is not None:
             from omg.realtime.sim_stream import SimStreamConfig, SimStreamServer
 
@@ -937,6 +1153,8 @@ def main() -> None:
             joint_order_hash=contract.joint_order_hash,
             audio_player=audio_player,
             ack_reader=ack_reader,
+            lowstate_history=lowstate_history,
+            lowstate_reader=lowstate_reader,
             sim_stream=sim_stream,
             status_callback=status_callback,
             planner_client_factory=lambda: ZmqPlanClient(args.connect),
@@ -964,6 +1182,16 @@ def main() -> None:
             f"protocol=trajectory_v1 audio_step={audio_step}",
             flush=True,
         )
+        print(
+            f"[BUMI→GMT] planner history source={args.history_source} "
+            + (
+                f"lowstate_key={lowstate_key} max_age={args.lowstate_max_age_ms:g}ms; "
+                "root xyz remains reference"
+                if args.history_source == "lowstate"
+                else "(emitted reference trajectory)"
+            ),
+            flush=True,
+        )
         period = 1.0 / args.tracker_fps
         deadline = time.perf_counter()
         while args.continuous or runtime.cursor < args.num_frames:
@@ -984,6 +1212,7 @@ def main() -> None:
             command_server.close if command_server is not None else None,
             runtime.close if runtime is not None else planner.close,
             ack_reader.close if ack_reader is not None else None,
+            lowstate_reader.close if lowstate_reader is not None else None,
             publisher.close,
             sim_stream.close if sim_stream is not None else None,
         ):
@@ -1009,6 +1238,7 @@ def main() -> None:
                 robot_name=np.asarray("bumi"),
                 joint_names=np.asarray(kinematics.joint_order),
                 quaternion_convention=np.asarray("wxyz"),
+                history_source=np.asarray(args.history_source),
             )
         if close_errors:
             raise RuntimeError(

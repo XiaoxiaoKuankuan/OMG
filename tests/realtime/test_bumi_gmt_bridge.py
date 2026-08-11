@@ -18,6 +18,7 @@ from omg.realtime.bumi_motion_mux import (
 )
 from omg.realtime.dynamic_condition import DynamicConditionController
 from omg.realtime.gmt_trajectory import (
+    GmtLowStateFeedback,
     GmtTrajectoryAck,
     GmtTrajectoryPacket,
     joint_order_sha256,
@@ -98,20 +99,53 @@ class _AckReader:
         }
 
 
+class _LowStateReader:
+    def __init__(self, order_hash: bytes) -> None:
+        self.order_hash = order_hash
+        self.available = True
+        self.sequence = 0
+        self.samples: list[GmtLowStateFeedback] = []
+
+    def latest_feedback(self, *, max_age_seconds=None):
+        del max_age_seconds
+        if not self.available:
+            return None
+        self.sequence += 1
+        sample = GmtLowStateFeedback(
+            sequence=self.sequence,
+            captured_unix_ns=self.sequence * 1_000_000,
+            joint_order_hash=self.order_hash,
+            root_quat_wxyz=np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            joint_pos=(
+                np.arange(21, dtype=np.float32) + np.float32(self.sequence)
+            ),
+        )
+        self.samples.append(sample)
+        return sample
+
+    def status(self):
+        return {"latest_sequence": self.sequence, "available": self.available}
+
+
 def _runtime(
     controller: DynamicConditionController,
     *,
     planner: _Planner | None = None,
     ack_reader=None,
+    history_source: str = "reference",
+    lowstate_reader=None,
+    native_to_gmt: np.ndarray | None = None,
 ):
     idle = _idle()
     planner = planner or _Planner()
     publisher = _Publisher()
     player = _AudioPlayer()
+    order_hash = joint_order_sha256([f"j{i}" for i in range(21)])
     runtime = BumiGmtRuntime(
         config=BumiGmtRuntimeConfig(
             replan_remaining_frames=60,
             status_interval_seconds=1000.0,
+            history_source=history_source,
         ),
         controller=controller,
         planner_client=planner,
@@ -129,10 +163,23 @@ def _runtime(
         ),
         trajectory_history=BumiTrajectoryHistory(idle),
         publisher=publisher,
-        native_to_gmt=np.arange(21),
-        joint_order_hash=joint_order_sha256([f"j{i}" for i in range(21)]),
+        native_to_gmt=(
+            np.arange(21) if native_to_gmt is None else native_to_gmt
+        ),
+        joint_order_hash=order_hash,
         audio_player=player,  # type: ignore[arg-type]
         ack_reader=ack_reader,
+        lowstate_history=(
+            BumiTrackerExecutionHistory(
+                np.repeat(idle[None], 10, axis=0),
+                tracker_fps=50.0,
+                history_fps=30.0,
+                history_frames=10,
+            )
+            if history_source == "lowstate"
+            else None
+        ),
+        lowstate_reader=lowstate_reader,
         clock=lambda: runtime.cursor / 50.0 if "runtime" in locals() else 0.0,
         stream_id=10,
     )
@@ -194,6 +241,52 @@ def test_text_requests_plan_and_pending_stand_never_requests_stand_text() -> Non
         request.metadata["condition_sequence"] != "text: stand still"
         for request in planner.requests
     )
+    runtime.close()
+
+
+def test_lowstate_history_waits_for_ten_real_samples_and_fuses_reference_xyz() -> None:
+    controller = DynamicConditionController(tracker_fps=50.0)
+    order_hash = joint_order_sha256([f"j{i}" for i in range(21)])
+    reader = _LowStateReader(order_hash)
+    permutation = np.arange(20, -1, -1, dtype=np.int64)
+    runtime, planner, _publisher, _player = _runtime(
+        controller,
+        history_source="lowstate",
+        lowstate_reader=reader,
+        native_to_gmt=permutation,
+    )
+    controller.accept_text("walk forward")
+
+    # 10 frames at 30 Hz span 16 tracker samples at 50 Hz.  Until that
+    # measured interval exists the bridge stays in fixed waiting pose.
+    for _ in range(16):
+        runtime.step()
+    assert planner.requests == []
+    runtime.step()
+    assert len(planner.requests) == 1
+
+    request = planner.requests[0]
+    history = request.qpos_36_history
+    assert history.shape == (10, 28)
+    assert request.metadata["history_source"] == "lowstate"
+    assert request.metadata["history_root_xyz_source"] == "reference"
+    np.testing.assert_allclose(
+        history[:, :3], np.repeat(_idle()[None, :3], 10, axis=0), atol=1e-6
+    )
+    expected_native = np.empty((21,), dtype=np.float32)
+    expected_native[permutation] = reader.samples[-2].joint_pos
+    np.testing.assert_allclose(history[-1, 7:], expected_native)
+    assert runtime.status()["planner_history"]["ready"] is True
+
+    # Losing fresh LowState never silently falls back to reference history.
+    planner.responses.append(_response(request))
+    runtime.step()
+    reader.available = False
+    runtime.step()
+    controller.accept_text("turn left")
+    runtime.step()
+    assert len(planner.requests) == 1
+    assert runtime.status()["planner_history"]["ready"] is False
     runtime.close()
 
 

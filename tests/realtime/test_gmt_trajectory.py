@@ -8,6 +8,7 @@ from omg.realtime.gmt_trajectory import (
     TRAJECTORY_CURRENT_INDEX,
     TRAJECTORY_FRAME_COUNT,
     GmtPolicyContract,
+    GmtLowStateFeedback,
     GmtTrajectoryAck,
     GmtTrajectoryPacket,
     build_policy_default_idle_qpos,
@@ -37,6 +38,27 @@ def test_trajectory_ack_v1_roundtrip_and_rejects_wrong_size() -> None:
     assert decoded == ack
     with pytest.raises(ValueError, match="must contain"):
         GmtTrajectoryAck.decode(ack.encode()[:-1])
+
+
+def test_lowstate_v1_roundtrip_crc_and_joint_hash() -> None:
+    names = tuple(f"joint_{index}" for index in range(21))
+    expected = GmtLowStateFeedback(
+        sequence=17,
+        captured_unix_ns=123456,
+        joint_order_hash=joint_order_sha256(names),
+        root_quat_wxyz=np.asarray([1.2, 0.0, 0.0, 0.0], dtype=np.float32),
+        joint_pos=np.arange(21, dtype=np.float32),
+    )
+    decoded = GmtLowStateFeedback.decode(expected.encode())
+    assert decoded.sequence == 17
+    assert decoded.captured_unix_ns == 123456
+    assert decoded.joint_order_hash == joint_order_sha256(names)
+    np.testing.assert_allclose(decoded.root_quat_wxyz, [1.0, 0.0, 0.0, 0.0])
+    np.testing.assert_array_equal(decoded.joint_pos, np.arange(21, dtype=np.float32))
+    corrupt = bytearray(expected.encode())
+    corrupt[-1] ^= 1
+    with pytest.raises(ValueError, match="CRC32"):
+        GmtLowStateFeedback.decode(corrupt)
 
 
 def test_trajectory_v1_roundtrip_crc_and_exact_temporal_layout() -> None:
