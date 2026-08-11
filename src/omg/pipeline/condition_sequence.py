@@ -348,18 +348,26 @@ def condition_sequence_audio(
     tracker_fps: float,
     num_frames: int,
     timeline_starts: dict[str, int] | None = None,
+    elapsed_tracker_frames: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     chunk = condition_sequence_for_plan(condition_sequence, int(plan_index))
     if chunk is None or chunk.audio_features is None:
         return None
     start_frame = int(chunk.audio_start_frame)
-    if chunk.audio_timeline_key is not None and request_tracker_frame is not None:
+    if chunk.audio_timeline_key is not None and elapsed_tracker_frames is not None:
+        elapsed = max(0, int(elapsed_tracker_frames))
+        start_frame = int(
+            np.floor(float(elapsed) * float(target_fps) / float(tracker_fps) + 1e-9)
+        )
+    elif chunk.audio_timeline_key is not None and request_tracker_frame is not None:
         if timeline_starts is not None:
             segment_start = int(timeline_starts.setdefault(chunk.audio_timeline_key, int(request_tracker_frame)))
         else:
             segment_start = int(request_tracker_frame)
-        elapsed_tracker_frames = max(0, int(request_tracker_frame) - segment_start)
-        start_frame = int(np.floor(float(elapsed_tracker_frames) * float(target_fps) / float(tracker_fps) + 1e-9))
+        elapsed = max(0, int(request_tracker_frame) - segment_start)
+        start_frame = int(
+            np.floor(float(elapsed) * float(target_fps) / float(tracker_fps) + 1e-9)
+        )
     return chunk.audio_features.features_for_frame(start_frame, num_frames=int(num_frames))
 
 

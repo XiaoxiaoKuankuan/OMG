@@ -109,6 +109,21 @@ def test_continuation_start_step_counts_remaining_denoise_steps():
         _continuation_start_step(50, 51)
 
 
+def test_onnx_noise_matches_checkpoint_torch_generator_sequence():
+    planner = object.__new__(OnnxDiffusionPlanner)
+    planner.torch_device = torch.device("cpu")
+    planner.rng = torch.Generator(device=planner.torch_device).manual_seed(17)
+    expected_rng = torch.Generator(device=planner.torch_device).manual_seed(17)
+
+    first = planner._standard_normal((1, 3, 4))
+    second = planner._standard_normal((1, 3, 4))
+
+    expected_first = torch.randn((1, 3, 4), generator=expected_rng).numpy()
+    expected_second = torch.randn((1, 3, 4), generator=expected_rng).numpy()
+    np.testing.assert_array_equal(first, expected_first)
+    np.testing.assert_array_equal(second, expected_second)
+
+
 def test_diffusion_continuation_state_stays_out_of_saved_metadata(tmp_path):
     state = DiffusionContinuationState(
         latent_states=np.zeros((2, 3, 4), dtype=np.float32),
@@ -203,7 +218,8 @@ def test_pipeline_async_defaults_to_tensorrt_fp16_and_cache(tmp_path):
 
 def _dit_cache_test_planner(*, enabled: bool):
     planner = object.__new__(OnnxDiffusionPlanner)
-    planner.rng = np.random.default_rng(0)
+    planner.torch_device = torch.device("cpu")
+    planner.rng = torch.Generator(device=planner.torch_device).manual_seed(0)
     planner.sequence_length = 2
     planner.feat_dim = 1
     planner.sample_timestep_map = np.arange(5, dtype=np.int64)

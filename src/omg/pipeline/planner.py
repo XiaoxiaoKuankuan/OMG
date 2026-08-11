@@ -480,7 +480,9 @@ class OnnxDiffusionPlanner:
         validate_active_onnx_providers(self.providers, self.session.get_providers())
         self.input_names = {item.name for item in self.session.get_inputs()}
         self.torch_device = _torch_device(torch_device)
-        self.rng = np.random.default_rng(int(seed))
+        self.seed = int(seed)
+        self.rng = torch.Generator(device=self.torch_device)
+        self.rng.manual_seed(self.seed)
         self._onnx_infer_seconds = 0.0
         self._onnx_run_seconds: list[float] = []
         self._dit_cache_similarity_seconds = 0.0
@@ -540,6 +542,23 @@ class OnnxDiffusionPlanner:
                 output_dim=self.text_dim,
             ).to(self.torch_device).eval()
         self._text_condition_cache: dict[str, tuple[dict[str, np.ndarray], dict[str, np.ndarray]]] = {}
+
+    def _standard_normal(self, shape: Sequence[int]) -> np.ndarray:
+        """Draw diffusion noise with the same device RNG used by checkpoint sampling."""
+
+        if isinstance(self.rng, torch.Generator):
+            return (
+                torch.randn(
+                    tuple(int(dim) for dim in shape),
+                    device=self.torch_device,
+                    dtype=torch.float32,
+                    generator=self.rng,
+                )
+                .cpu()
+                .numpy()
+            )
+        # Preserve support for lightweight tests and callers that inject a NumPy-like RNG.
+        return np.asarray(self.rng.standard_normal(shape), dtype=np.float32)
 
     def default_seed_qpos(self) -> np.ndarray:
         """Return the representation's grounded default history without loading a dataset."""
@@ -1007,7 +1026,7 @@ class OnnxDiffusionPlanner:
         null_human_motion: dict[str, np.ndarray] | None = None,
         continuation_init: _ContinuationInit | None = None,
     ) -> tuple[np.ndarray, DiffusionContinuationState, _DitCacheStats]:
-        x = self.rng.standard_normal((1, self.sequence_length, self.feat_dim)).astype(np.float32)
+        x = self._standard_normal((1, self.sequence_length, self.feat_dim))
         max_step = self.sample_timestep_map.shape[0] - 1
         if continuation_init is not None and not (0 <= int(continuation_init.start_step) <= max_step):
             raise ValueError(f"Continuation start step {continuation_init.start_step} is outside the sampling schedule")
@@ -1083,7 +1102,9 @@ class OnnxDiffusionPlanner:
                 + np.sqrt(max(1.0 - alpha_bar_prev - sigma * sigma, 0.0)) * eps
             )
             if step > 0:
-                x = mean_pred + sigma * self.rng.standard_normal(x.shape).astype(np.float32)
+                # Match GuidedDiffusion.sample exactly: torch.randn_like consumes one
+                # draw per non-final DDIM step even when ddim_eta (and sigma) is zero.
+                x = mean_pred + sigma * self._standard_normal(x.shape)
             else:
                 x = mean_pred
             if continuation_init is not None and step <= continuation_init.start_step:
@@ -1168,7 +1189,7 @@ class OnnxDiffusionPlanner:
         continuation_features = self.representation.codec.assemble_features(recanonicalized)
         continuation_latent = self.representation.normalize_features(continuation_features)
         x0 = continuation_latent.detach().cpu().numpy().astype(np.float32, copy=False)
-        noise = self.rng.standard_normal(x0.shape).astype(np.float32)
+        noise = self._standard_normal(x0.shape)
         return _ContinuationInit(
             x0=x0,
             noise=noise,
@@ -1475,6 +1496,8 @@ class OnnxDiffusionPlanner:
             "dit_cache_chunks": dit_cache_metadata_chunks,
             "num_frames": int(num_frames),
             "fps": float(fps),
+            "seed": self.seed,
+            "rng_backend": f"torch:{self.torch_device}",
             "cfg_scale": scale,
             "cfg_text_scale": resolved_cfg_text_scale,
             "cfg_audio_scale": resolved_cfg_audio_scale,

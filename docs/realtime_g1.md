@@ -2,6 +2,8 @@
 
 Realtime dynamic commands: [docs/realtime_commands.md](realtime_commands.md)
 
+BUMI 原生 OMG→GMT： [docs/realtime_bumi_gmt.md](realtime_bumi_gmt.md)
+
 实时部署使用三个进程：
 
 1. G1 Orin 上的 HoloMotion 部署进程。

@@ -369,12 +369,21 @@ class DynamicConditionController:
         with self._lock:
             return self._snapshot_locked()
 
-    def snapshot_for_replan(self, *, current_tracker_frame: int) -> ConditionSnapshot:
+    def snapshot_for_replan(
+        self,
+        *,
+        current_tracker_frame: int,
+        start_audio: bool = True,
+    ) -> ConditionSnapshot:
         frame = int(current_tracker_frame)
         if frame < 0:
             raise ValueError(f"current_tracker_frame must be non-negative, got {frame}")
         with self._lock:
-            if self._command.command_type == "audio" and self._audio_start_tracker_frame is None:
+            if (
+                start_audio
+                and self._command.command_type == "audio"
+                and self._audio_start_tracker_frame is None
+            ):
                 duration = float(self._audio_duration_seconds)
                 self._audio_start_tracker_frame = frame
                 self._audio_end_tracker_frame = frame + int(math.ceil(duration * self._tracker_fps))
@@ -384,6 +393,58 @@ class DynamicConditionController:
                     flush=True,
                 )
             return self._snapshot_locked()
+
+    def mark_audio_execution_started(
+        self,
+        snapshot: ConditionSnapshot,
+        *,
+        current_tracker_frame: int,
+    ) -> bool:
+        """Start an audio clock when its first motion frame is actually emitted.
+
+        Existing bridges retain the historical ``snapshot_for_replan``
+        behavior.  A bridge that passes ``start_audio=False`` can call this
+        method on the first accepted output tick so diffusion latency is not
+        counted as music execution time.
+        """
+
+        frame = int(current_tracker_frame)
+        if frame < 0:
+            raise ValueError(f"current_tracker_frame must be non-negative, got {frame}")
+        with self._lock:
+            matches = (
+                self._command.command_type == "audio"
+                and snapshot.command_type == "audio"
+                and snapshot.command_id == self._command.command_id
+                and snapshot.revision == self._revision
+                and snapshot.condition_session_id == self._condition_session_id
+            )
+            if not matches or self._audio_start_tracker_frame is not None:
+                return False
+            duration = float(self._audio_duration_seconds)
+            self._audio_start_tracker_frame = frame
+            self._audio_end_tracker_frame = frame + int(
+                math.ceil(duration * self._tracker_fps)
+            )
+            print(
+                f"[dynamic-condition] audio start command_id={self._command.command_id} "
+                f"path={self._command.audio_path} duration={duration:.6f}s "
+                f"start_frame={frame}",
+                flush=True,
+            )
+            return True
+
+    def audio_elapsed_tracker_frames(self, current_tracker_frame: int) -> int:
+        frame = int(current_tracker_frame)
+        if frame < 0:
+            raise ValueError(f"current_tracker_frame must be non-negative, got {frame}")
+        with self._lock:
+            if (
+                self._command.command_type != "audio"
+                or self._audio_start_tracker_frame is None
+            ):
+                return 0
+            return max(0, frame - int(self._audio_start_tracker_frame))
 
     def mark_replan_submitted(self, snapshot: ConditionSnapshot) -> bool:
         with self._lock:

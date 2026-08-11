@@ -141,6 +141,11 @@ class RealtimeDiffusionPlannerService:
         )
         chunk = condition_sequence_for_plan(condition_sequence, condition_index)
         text = condition_sequence_text(condition_sequence, "", condition_index)
+        explicit_audio_elapsed = request.metadata.get(
+            "condition_elapsed_tracker_frames"
+        )
+        if explicit_audio_elapsed is not None:
+            explicit_audio_elapsed = max(0, int(explicit_audio_elapsed))
         audio_inputs = condition_sequence_audio(
             condition_sequence,
             condition_index,
@@ -149,6 +154,7 @@ class RealtimeDiffusionPlannerService:
             tracker_fps=float(sequence_metadata["tracker_fps"]),
             num_frames=self.plan_frames,
             timeline_starts=timeline_starts,
+            elapsed_tracker_frames=explicit_audio_elapsed,
         )
         human_inputs = condition_sequence_human(
             condition_sequence,
@@ -159,7 +165,19 @@ class RealtimeDiffusionPlannerService:
         if audio_inputs is not None and chunk is not None:
             audio_features, audio_mask = audio_inputs
             audio_start_frame = int(chunk.audio_start_frame)
-            if chunk.audio_timeline_key is not None:
+            if (
+                chunk.audio_timeline_key is not None
+                and explicit_audio_elapsed is not None
+            ):
+                audio_start_frame = int(
+                    np.floor(
+                        float(explicit_audio_elapsed)
+                        * float(sequence_metadata["audio_fps"])
+                        / float(sequence_metadata["tracker_fps"])
+                        + 1e-9
+                    )
+                )
+            elif chunk.audio_timeline_key is not None:
                 segment_start = int(
                     timeline_starts.get(
                         chunk.audio_timeline_key,
@@ -184,6 +202,7 @@ class RealtimeDiffusionPlannerService:
                 "audio_fps": float(sequence_metadata["audio_fps"]),
                 "tracker_fps": float(sequence_metadata["tracker_fps"]),
                 "request_tracker_frame": int(request.tracker_frame),
+                "condition_elapsed_tracker_frames": explicit_audio_elapsed,
             }
         human_metadata = None
         if human_inputs is not None and chunk is not None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from omg.realtime.dynamic_condition import DynamicConditionController
 
@@ -29,6 +29,7 @@ class DynamicCommandServer:
         config: CommandServerConfig,
         controller: DynamicConditionController,
         status_callback: Callable[[dict[str, Any]], None] | None = None,
+        status_provider: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         if not str(config.bind).strip():
             raise ValueError("Command server bind URI must be non-empty")
@@ -37,6 +38,7 @@ class DynamicCommandServer:
         self.config = config
         self.controller = controller
         self.status_callback = status_callback
+        self.status_provider = status_provider
         self._stop = threading.Event()
         self._started = threading.Event()
         self._thread: threading.Thread | None = None
@@ -101,7 +103,10 @@ class DynamicCommandServer:
             raise ValueError("Command request must be a JSON object")
         command_type = request.get("type")
         if isinstance(command_type, str) and command_type.strip().lower() == "status":
-            return {"ok": True, "active": self.controller.active_status()}
+            response = {"ok": True, "active": self.controller.active_status()}
+            if self.status_provider is not None:
+                response["runtime"] = dict(self.status_provider())
+            return response
         command = self.controller.accept_command(request)
         active = self.controller.active_status()
         event = {
