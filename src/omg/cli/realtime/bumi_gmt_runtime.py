@@ -92,12 +92,39 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--history-frames", type=_positive_int, default=10)
     parser.add_argument(
         "--history-source",
-        choices=["reference", "lowstate"],
+        choices=["reference", "lowstate", "hybrid"],
         default="reference",
         help=(
-            "Planner history source; lowstate fuses measured IMU/joints with "
-            "root xyz from the emitted reference"
+            "Planner history source: reference uses emitted motion, lowstate uses "
+            "measured IMU/joints, and hybrid progressively blends all history "
+            "frames toward measurements; root xyz always remains reference"
         ),
+    )
+    parser.add_argument(
+        "--hybrid-history-beta",
+        default="0.10,0.15,0.20,0.30,0.40,0.50,0.60,0.70,0.80,1.00",
+        help=(
+            "Comma-separated oldest-to-newest Hybrid weights; count must match "
+            "--history-frames and the final value must be 1.0"
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-max-rotation-error-deg",
+        type=float,
+        default=25.0,
+        help="Geodesic cap for each reference-to-measured root rotation error",
+    )
+    parser.add_argument(
+        "--hybrid-max-tilt-error-deg",
+        type=float,
+        default=20.0,
+        help="Pause replanning above this reference/measured body-up angle",
+    )
+    parser.add_argument(
+        "--hybrid-hard-root-tilt-deg",
+        type=float,
+        default=45.0,
+        help="Pause replanning when the measured root exceeds this world tilt",
     )
     parser.add_argument("--planner-frames", type=_positive_int, default=60)
     parser.add_argument("--replan-remaining-frames", type=int, default=60)
@@ -187,6 +214,14 @@ def _bridge_command(args: argparse.Namespace, connect: str) -> list[str]:
         str(args.history_frames),
         "--history-source",
         str(args.history_source),
+        "--hybrid-history-beta",
+        str(args.hybrid_history_beta),
+        "--hybrid-max-rotation-error-deg",
+        str(args.hybrid_max_rotation_error_deg),
+        "--hybrid-max-tilt-error-deg",
+        str(args.hybrid_max_tilt_error_deg),
+        "--hybrid-hard-root-tilt-deg",
+        str(args.hybrid_hard_root_tilt_deg),
         "--planner-frames",
         str(args.planner_frames),
         "--replan-remaining-frames",

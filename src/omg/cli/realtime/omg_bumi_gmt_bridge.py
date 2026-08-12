@@ -17,6 +17,9 @@ from omg.realtime.bumi_motion_mux import (
     BumiMotionTick,
     BumiTrackerExecutionHistory,
     BumiTrajectoryHistory,
+    blend_bumi_history_toward_measurement,
+    root_tilt_angle_wxyz,
+    root_tilt_error_angle_wxyz,
 )
 from omg.realtime.command_server import CommandServerConfig, DynamicCommandServer
 from omg.realtime.dynamic_condition import (
@@ -51,6 +54,20 @@ from omg.realtime.status_log import append_jsonl
 from omg.realtime.transport import ZmqPlanClient
 
 
+DEFAULT_HYBRID_HISTORY_BETA = (
+    0.10,
+    0.15,
+    0.20,
+    0.30,
+    0.40,
+    0.50,
+    0.60,
+    0.70,
+    0.80,
+    1.00,
+)
+
+
 @dataclass(frozen=True)
 class BumiGmtRuntimeConfig:
     tracker_fps: float = 50.0
@@ -67,6 +84,10 @@ class BumiGmtRuntimeConfig:
     status_interval_seconds: float = 1.0
     history_source: str = "reference"
     lowstate_max_age_seconds: float = 0.2
+    hybrid_history_beta: tuple[float, ...] = DEFAULT_HYBRID_HISTORY_BETA
+    hybrid_max_rotation_error_degrees: float = 25.0
+    hybrid_max_tilt_error_degrees: float = 20.0
+    hybrid_hard_root_tilt_degrees: float = 45.0
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -76,6 +97,12 @@ class BumiGmtRuntimeConfig:
             ("status_interval_seconds", self.status_interval_seconds),
             ("audio_ack_timeout_seconds", self.audio_ack_timeout_seconds),
             ("lowstate_max_age_seconds", self.lowstate_max_age_seconds),
+            (
+                "hybrid_max_rotation_error_degrees",
+                self.hybrid_max_rotation_error_degrees,
+            ),
+            ("hybrid_max_tilt_error_degrees", self.hybrid_max_tilt_error_degrees),
+            ("hybrid_hard_root_tilt_degrees", self.hybrid_hard_root_tilt_degrees),
         ):
             if not np.isfinite(float(value)) or float(value) <= 0.0:
                 raise ValueError(f"{name} must be positive and finite")
@@ -87,10 +114,28 @@ class BumiGmtRuntimeConfig:
             raise ValueError("condition_audio_step_frames must be positive")
         if int(self.request_timeout_ms) <= 0:
             raise ValueError("request_timeout_ms must be positive")
-        if self.history_source not in {"reference", "lowstate"}:
+        if self.history_source not in {"reference", "lowstate", "hybrid"}:
             raise ValueError(
-                "history_source must be either 'reference' or 'lowstate'"
+                "history_source must be 'reference', 'lowstate', or 'hybrid'"
             )
+        if self.history_source == "hybrid":
+            beta = np.asarray(self.hybrid_history_beta, dtype=np.float64)
+            if beta.shape != (int(self.history_frames),):
+                raise ValueError(
+                    "hybrid_history_beta must contain exactly history_frames values"
+                )
+            if (
+                not np.isfinite(beta).all()
+                or np.any(beta < 0.0)
+                or np.any(beta > 1.0)
+                or np.any(np.diff(beta) < 0.0)
+            ):
+                raise ValueError(
+                    "hybrid_history_beta must be finite, non-decreasing, and within "
+                    "[0,1]"
+                )
+            if not np.isclose(beta[-1], 1.0):
+                raise ValueError("hybrid_history_beta must end at 1.0")
 
 
 @dataclass(frozen=True)
@@ -148,11 +193,12 @@ class BumiGmtRuntime:
         self.ack_reader = ack_reader
         self.lowstate_history = lowstate_history
         self.lowstate_reader = lowstate_reader
-        if self.config.history_source == "lowstate" and (
+        if self.config.history_source in {"lowstate", "hybrid"} and (
             self.lowstate_history is None or self.lowstate_reader is None
         ):
             raise ValueError(
-                "history_source=lowstate requires a LowState reader and history buffer"
+                f"history_source={self.config.history_source} requires a LowState "
+                "reader and history buffer"
             )
         self.sim_stream = sim_stream
         self.status_callback = status_callback
@@ -181,13 +227,15 @@ class BumiGmtRuntime:
         self._last_lowstate_identity: tuple[int, int] | None = None
         self._lowstate_rejection_reason: str | None = None
         self._lowstate_ready_announced = False
+        self._latest_measured_root_tilt_degrees: float | None = None
+        self._latest_root_tilt_error_degrees: float | None = None
 
     def _emit(self, event: dict[str, Any]) -> None:
         if self.status_callback is not None:
             self.status_callback(dict(event))
 
     def _lowstate_history_ready(self) -> bool:
-        if self.config.history_source != "lowstate":
+        if self.config.history_source == "reference":
             return True
         assert self.lowstate_history is not None
         return bool(
@@ -203,12 +251,24 @@ class BumiGmtRuntime:
         if not self._lowstate_history_ready():
             return None
         assert self.lowstate_history is not None
-        return self.lowstate_history.planner_history()
+        measured = self.lowstate_history.planner_history()
+        if self.config.history_source == "lowstate":
+            return measured
+        reference = self.planner_history.planner_history()
+        return blend_bumi_history_toward_measurement(
+            reference,
+            measured,
+            beta=self.config.hybrid_history_beta,
+            max_rotation_error_radians=np.deg2rad(
+                self.config.hybrid_max_rotation_error_degrees
+            ),
+        )
 
     def _invalidate_lowstate_history(
         self, *, reason: str, reference_qpos: np.ndarray
     ) -> None:
         was_fresh = self._lowstate_stream_fresh
+        previous_reason = self._lowstate_rejection_reason
         self._lowstate_stream_fresh = False
         self._lowstate_valid_tracker_frames = 0
         self._lowstate_unique_samples = 0
@@ -217,10 +277,11 @@ class BumiGmtRuntime:
         self._lowstate_ready_announced = False
         if self.lowstate_history is not None:
             self.lowstate_history.reset(reference_qpos)
-        if was_fresh:
+        if was_fresh or reason != previous_reason:
             print(
                 f"[BUMI history] LowState unavailable ({reason}); "
-                "pausing new replans until 10 measured history frames are ready",
+                f"pausing new replans until {self.config.history_frames} measured "
+                "history frames are ready",
                 flush=True,
             )
             self._emit(
@@ -235,7 +296,7 @@ class BumiGmtRuntime:
         """Append reference history and, when selected, a fused LowState pose."""
 
         self.planner_history.append(reference_qpos)
-        if self.config.history_source != "lowstate":
+        if self.config.history_source == "reference":
             return
         assert self.lowstate_reader is not None
         assert self.lowstate_history is not None
@@ -252,6 +313,42 @@ class BumiGmtRuntime:
                 reason="joint_order_hash_mismatch", reference_qpos=reference_qpos
             )
             return
+
+        measured_tilt_degrees = float(
+            np.rad2deg(root_tilt_angle_wxyz(sample.root_quat_wxyz))
+        )
+        tilt_error_degrees = float(
+            np.rad2deg(
+                root_tilt_error_angle_wxyz(
+                    reference_qpos[3:7], sample.root_quat_wxyz
+                )
+            )
+        )
+        self._latest_measured_root_tilt_degrees = measured_tilt_degrees
+        self._latest_root_tilt_error_degrees = tilt_error_degrees
+        if self.config.history_source == "hybrid":
+            if measured_tilt_degrees > float(
+                self.config.hybrid_hard_root_tilt_degrees
+            ):
+                self._invalidate_lowstate_history(
+                    reason=(
+                        "unsafe_measured_root_tilt:"
+                        f"{measured_tilt_degrees:.2f}deg"
+                    ),
+                    reference_qpos=reference_qpos,
+                )
+                return
+            if tilt_error_degrees > float(
+                self.config.hybrid_max_tilt_error_degrees
+            ):
+                self._invalidate_lowstate_history(
+                    reason=(
+                        "unsafe_root_tilt_error:"
+                        f"{tilt_error_degrees:.2f}deg"
+                    ),
+                    reference_qpos=reference_qpos,
+                )
+                return
 
         fused = np.asarray(reference_qpos, dtype=np.float32).copy()
         # root xyz stays exactly on the current reference trajectory.  LowState
@@ -276,9 +373,9 @@ class BumiGmtRuntime:
         if self._lowstate_history_ready() and not self._lowstate_ready_announced:
             self._lowstate_ready_announced = True
             print(
-                f"[BUMI history] LowState history ready: "
+                f"[BUMI history] {self.config.history_source} history ready: "
                 f"{self.config.history_frames} frames @ {self.config.history_fps:g} Hz; "
-                "root xyz=reference, root quat/joints=LowState",
+                "root xyz=reference, root quat/joints use measured feedback",
                 flush=True,
             )
             self._emit(
@@ -302,9 +399,15 @@ class BumiGmtRuntime:
             "ready": self._lowstate_history_ready(),
             "root_xyz_source": "reference",
             "root_quaternion_source": (
-                "lowstate" if self.config.history_source == "lowstate" else "reference"
+                "reference_to_lowstate_geodesic"
+                if self.config.history_source == "hybrid"
+                else self.config.history_source
             ),
-            "joint_position_source": self.config.history_source,
+            "joint_position_source": (
+                "reference_to_lowstate_beta"
+                if self.config.history_source == "hybrid"
+                else self.config.history_source
+            ),
             "valid_tracker_frames": int(self._lowstate_valid_tracker_frames),
             "unique_lowstate_samples": int(self._lowstate_unique_samples),
             "required_tracker_frames": (
@@ -313,6 +416,22 @@ class BumiGmtRuntime:
                 else int(self.lowstate_history.required_tracker_frames)
             ),
             "rejection_reason": self._lowstate_rejection_reason,
+            "hybrid_beta": (
+                list(self.config.hybrid_history_beta)
+                if self.config.history_source == "hybrid"
+                else None
+            ),
+            "hybrid_max_rotation_error_degrees": float(
+                self.config.hybrid_max_rotation_error_degrees
+            ),
+            "hybrid_max_tilt_error_degrees": float(
+                self.config.hybrid_max_tilt_error_degrees
+            ),
+            "hybrid_hard_root_tilt_degrees": float(
+                self.config.hybrid_hard_root_tilt_degrees
+            ),
+            "measured_root_tilt_degrees": self._latest_measured_root_tilt_degrees,
+            "root_tilt_error_degrees": self._latest_root_tilt_error_degrees,
             "reader": reader_status,
         }
 
@@ -334,6 +453,10 @@ class BumiGmtRuntime:
                 "fixed_idle_for_stand": True,
                 "history_source": self.config.history_source,
                 "history_root_xyz_source": "reference",
+                "hybrid_history_beta": list(self.config.hybrid_history_beta),
+                "hybrid_max_rotation_error_degrees": float(
+                    self.config.hybrid_max_rotation_error_degrees
+                ),
                 "condition_elapsed_tracker_frames": int(
                     self.controller.audio_elapsed_tracker_frames(self.cursor)
                 ),
@@ -904,6 +1027,18 @@ class BumiGmtRuntime:
         self.planner_client.close()
 
 
+def _parse_hybrid_history_beta(value: str) -> tuple[float, ...]:
+    try:
+        result = tuple(float(part.strip()) for part in str(value).split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "hybrid beta must be a comma-separated list of numbers"
+        ) from exc
+    if not result:
+        raise argparse.ArgumentTypeError("hybrid beta must not be empty")
+    return result
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Publish native OMG BUMI qpos to the GMT trajectory_v1 Redis input."
@@ -919,12 +1054,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--history-frames", type=int, default=10)
     parser.add_argument(
         "--history-source",
-        choices=["reference", "lowstate"],
+        choices=["reference", "lowstate", "hybrid"],
         default="reference",
         help=(
             "Planner history source. lowstate uses GMT IMU quaternion and measured "
-            "joints while retaining root xyz from the emitted reference trajectory."
+            "joints; hybrid progressively pulls all history frames toward those "
+            "measurements. Root xyz always remains reference."
         ),
+    )
+    parser.add_argument(
+        "--hybrid-history-beta",
+        type=_parse_hybrid_history_beta,
+        default=DEFAULT_HYBRID_HISTORY_BETA,
+        help=(
+            "Comma-separated oldest-to-newest fusion weights; count must equal "
+            "--history-frames and the last value must be 1.0"
+        ),
+    )
+    parser.add_argument(
+        "--hybrid-max-rotation-error-deg", type=float, default=25.0
+    )
+    parser.add_argument(
+        "--hybrid-max-tilt-error-deg", type=float, default=20.0
+    )
+    parser.add_argument(
+        "--hybrid-hard-root-tilt-deg", type=float, default=45.0
     )
     parser.add_argument("--planner-frames", type=int, default=60)
     parser.add_argument("--replan-remaining-frames", type=int, default=60)
@@ -1029,6 +1183,10 @@ def main() -> None:
         status_interval_seconds=args.status_interval_seconds,
         history_source=args.history_source,
         lowstate_max_age_seconds=float(args.lowstate_max_age_ms) / 1000.0,
+        hybrid_history_beta=tuple(args.hybrid_history_beta),
+        hybrid_max_rotation_error_degrees=args.hybrid_max_rotation_error_deg,
+        hybrid_max_tilt_error_degrees=args.hybrid_max_tilt_error_deg,
+        hybrid_hard_root_tilt_degrees=args.hybrid_hard_root_tilt_deg,
     )
     controller = DynamicConditionController(
         tracker_fps=args.tracker_fps,
@@ -1062,7 +1220,7 @@ def main() -> None:
             history_fps=args.history_fps,
             history_frames=args.history_frames,
         )
-        if args.history_source == "lowstate"
+        if args.history_source in {"lowstate", "hybrid"}
         else None
     )
     trajectory_history = BumiTrajectoryHistory(idle_qpos)
@@ -1104,7 +1262,7 @@ def main() -> None:
                 ),
             )
         )
-        if args.history_source == "lowstate"
+        if args.history_source in {"lowstate", "hybrid"}
         else None
     )
     audio_player = SynchronizedAudioPlayer(
@@ -1187,7 +1345,7 @@ def main() -> None:
             + (
                 f"lowstate_key={lowstate_key} max_age={args.lowstate_max_age_ms:g}ms; "
                 "root xyz remains reference"
-                if args.history_source == "lowstate"
+                if args.history_source in {"lowstate", "hybrid"}
                 else "(emitted reference trajectory)"
             ),
             flush=True,
@@ -1239,6 +1397,18 @@ def main() -> None:
                 joint_names=np.asarray(kinematics.joint_order),
                 quaternion_convention=np.asarray("wxyz"),
                 history_source=np.asarray(args.history_source),
+                hybrid_history_beta=np.asarray(
+                    args.hybrid_history_beta, dtype=np.float32
+                ),
+                hybrid_max_rotation_error_degrees=np.float32(
+                    args.hybrid_max_rotation_error_deg
+                ),
+                hybrid_max_tilt_error_degrees=np.float32(
+                    args.hybrid_max_tilt_error_deg
+                ),
+                hybrid_hard_root_tilt_degrees=np.float32(
+                    args.hybrid_hard_root_tilt_deg
+                ),
             )
         if close_errors:
             raise RuntimeError(

@@ -260,6 +260,31 @@ joint position       GMT LowState
 发起新规划；反馈超过默认 200 ms 未更新时不会静默回退到 reference history。
 当前动作缓冲仍正常执行，耗尽后回固定站立。
 
+`--history-source hybrid` 是实机跟踪不够理想时的折中模式。它同时取同一时刻的
+reference history 与 LowState history，对全部 10 帧按从旧到新的权重融合：
+
+```text
+beta = [0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 1.00]
+joint[i] = reference[i] + beta[i] * (measured[i] - reference[i])
+root_xyz[i] = reference_root_xyz[i]
+```
+
+因此 OMG 看到的是一段连续走向真实状态的历史，而不是 9 帧理想动作后突然接
+一帧跟踪失败状态。根姿态不能按四元数四个分量线性平均。实现先求世界坐标系
+旋转误差：
+
+```text
+R_error = R_measured * inverse(R_reference)
+R_hybrid = interp(identity, clamp(R_error, 25 deg), beta) * R_reference
+```
+
+这里 `interp` 是 SO(3) 上的旋转向量缩放，等价于 identity 到限幅误差旋转的
+SLERP。四元数始终归一化并保持时间符号连续。yaw 偏差也受总旋转误差限幅；对
+roll/pitch 另有更谨慎的安全门控：默认实测 root 相对世界竖直倾斜超过 45 度，
+或实测与 reference 的 body-up 夹角超过 20 度时，不把该反馈送入 Planner，而是
+暂停新规划并重新积累安全 history。阈值可由 CLI 调整。该保护不替代 GMT 原有
+fall protection。
+
 Planner 使用 BUMI representation/kinematics 把 qpos 编码为：
 
 ```text
@@ -657,7 +682,7 @@ python -m omg.cli.realtime.bumi_gmt_runtime \
   --status-jsonl outputs_realtime/bumi_gmt/status.jsonl
 ```
 
-上面使用默认 `--history-source reference`。若希望规划历史主要来自 Gazebo/实机
+上面使用默认 `--history-source reference`。若希望规划历史直接来自 Gazebo/实机
 LowState，在终端 1 命令中增加：
 
 ```bash
@@ -668,6 +693,23 @@ LowState，在终端 1 命令中增加：
 
 此模式要先启动 GMT 并进入现有 GMT 安全激活状态；否则没有 LowState feedback，
 OMG 会继续发送固定站立但不会开始 diffusion 规划。
+
+实机建议先从 Hybrid 开始：
+
+```bash
+  --history-source hybrid \
+  --redis-lowstate-key gmt_online_frame_bumi_lowstate \
+  --lowstate-max-age-ms 200
+```
+
+默认 beta 和旋转/倾角保护通常不必写。需要实验时完整参数是：
+
+```bash
+  --hybrid-history-beta 0.10,0.15,0.20,0.30,0.40,0.50,0.60,0.70,0.80,1.00 \
+  --hybrid-max-rotation-error-deg 25 \
+  --hybrid-max-tilt-error-deg 20 \
+  --hybrid-hard-root-tilt-deg 45
+```
 
 参考动作网页：
 
@@ -777,10 +819,14 @@ python -m omg.cli.realtime.command_client status
 | `--tracker-fps` | `50` | 是 | Bridge/Redis 参考帧率 |
 | `--history-fps` | `30` | 是 | Planner history 帧率 |
 | `--history-frames` | `10` | 是 | Planner 历史帧数 |
-| `--history-source` | `reference` | 是 | `reference` 使用已发布参考；`lowstate` 融合实测姿态 |
+| `--history-source` | `reference` | 是 | `reference` 使用参考；`lowstate` 使用实测；`hybrid` 让10帧渐进靠近实测 |
 | `--redis-lowstate-key` | `<redis-key>_lowstate` | 是 | GMT→OMG LowState feedback key |
 | `--redis-lowstate-poll-ms` | `5` | 是 | OMG 后台轮询 LowState key 的间隔 |
 | `--lowstate-max-age-ms` | `200` | 是 | LowState 超过此年龄即暂停新规划 |
+| `--hybrid-history-beta` | `0.10,...,1.00`（10项） | 是 | Hybrid 从旧到新的逐帧实测融合权重 |
+| `--hybrid-max-rotation-error-deg` | `25` | 是 | 每帧 reference→measured 根旋转误差限幅 |
+| `--hybrid-max-tilt-error-deg` | `20` | 是 | reference/measured body-up 最大允许夹角 |
+| `--hybrid-hard-root-tilt-deg` | `45` | 是 | 实测根相对世界竖直的硬倾倒门限 |
 | `--planner-frames` | `60` | 是 | Planner 每次输出帧数 |
 | `--replan-remaining-frames` | `60` | 是 | 还剩 60×50Hz 帧时规划 |
 | `--condition-audio-step-frames` | 自动，当前为 `24` | 是 | 每次 replan 的音频时间轴步长 |

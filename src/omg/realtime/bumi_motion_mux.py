@@ -4,7 +4,7 @@ import copy
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
@@ -61,6 +61,104 @@ def coerce_bumi_qpos_motion(value: Any, *, name: str = "qpos") -> np.ndarray:
         if float(np.dot(result[index - 1, 3:7], result[index, 3:7])) < 0.0:
             result[index, 3:7] *= -1.0
     return result
+
+
+def root_tilt_angle_wxyz(quaternion: np.ndarray) -> float:
+    """Return yaw-independent root tilt from the world vertical, in radians."""
+
+    wxyz = normalize_quat_wxyz(np.asarray(quaternion, dtype=np.float32))
+    rotation = Rotation.from_quat(wxyz[[1, 2, 3, 0]])
+    body_up_w = rotation.apply(np.asarray([0.0, 0.0, 1.0]))
+    return float(np.arccos(np.clip(body_up_w[2], -1.0, 1.0)))
+
+
+def root_tilt_error_angle_wxyz(
+    reference_quaternion: np.ndarray,
+    measured_quaternion: np.ndarray,
+) -> float:
+    """Return the angle between reference and measured body-up directions."""
+
+    reference = normalize_quat_wxyz(
+        np.asarray(reference_quaternion, dtype=np.float32)
+    )
+    measured = normalize_quat_wxyz(
+        np.asarray(measured_quaternion, dtype=np.float32)
+    )
+    reference_up = Rotation.from_quat(reference[[1, 2, 3, 0]]).apply(
+        np.asarray([0.0, 0.0, 1.0])
+    )
+    measured_up = Rotation.from_quat(measured[[1, 2, 3, 0]]).apply(
+        np.asarray([0.0, 0.0, 1.0])
+    )
+    return float(
+        np.arccos(np.clip(float(np.dot(reference_up, measured_up)), -1.0, 1.0))
+    )
+
+
+def blend_bumi_history_toward_measurement(
+    reference_history: np.ndarray,
+    measured_history: np.ndarray,
+    *,
+    beta: Sequence[float],
+    max_rotation_error_radians: float,
+) -> np.ndarray:
+    """Smoothly pull a clean history toward the measured robot trajectory.
+
+    Root xyz always comes from ``reference_history``.  Joints use linear
+    interpolation of their angular error.  Root orientation uses the requested
+    world-frame error ``R_measured * R_reference^-1``: its geodesic angle is
+    capped, scaled by beta, then composed back onto the reference orientation.
+    Scaling a rotation vector is equivalent to SLERP from identity to the
+    capped error rotation and avoids component-wise quaternion averaging.
+    """
+
+    reference = coerce_bumi_qpos_motion(
+        reference_history, name="reference_history"
+    )
+    measured = coerce_bumi_qpos_motion(
+        measured_history, name="measured_history"
+    )
+    if reference.shape != measured.shape:
+        raise ValueError(
+            "reference_history and measured_history must have identical shapes, "
+            f"got {reference.shape} and {measured.shape}"
+        )
+    weights = np.asarray(tuple(beta), dtype=np.float64)
+    if weights.shape != (reference.shape[0],):
+        raise ValueError(
+            f"beta must contain one value per history frame ({reference.shape[0]}), "
+            f"got {weights.shape}"
+        )
+    if (
+        not np.isfinite(weights).all()
+        or np.any(weights < 0.0)
+        or np.any(weights > 1.0)
+        or np.any(np.diff(weights) < 0.0)
+    ):
+        raise ValueError("beta must be finite, non-decreasing, and within [0,1]")
+    maximum = float(max_rotation_error_radians)
+    if not np.isfinite(maximum) or maximum <= 0.0:
+        raise ValueError("max_rotation_error_radians must be positive and finite")
+
+    result = reference.copy()
+    result[:, 7:] = reference[:, 7:] + weights[:, None].astype(np.float32) * (
+        measured[:, 7:] - reference[:, 7:]
+    )
+    for index, amount in enumerate(weights):
+        reference_wxyz = reference[index, 3:7]
+        measured_wxyz = measured[index, 3:7]
+        reference_rotation = Rotation.from_quat(reference_wxyz[[1, 2, 3, 0]])
+        measured_rotation = Rotation.from_quat(measured_wxyz[[1, 2, 3, 0]])
+        error_rotation = measured_rotation * reference_rotation.inv()
+        error_vector = error_rotation.as_rotvec()
+        error_angle = float(np.linalg.norm(error_vector))
+        if error_angle > maximum:
+            error_vector *= maximum / error_angle
+        correction = Rotation.from_rotvec(error_vector * float(amount))
+        xyzw = (correction * reference_rotation).as_quat().astype(np.float32)
+        result[index, 3:7] = xyzw[[3, 0, 1, 2]]
+    # coerce also normalizes quaternion signs across the ten-frame sequence.
+    return coerce_bumi_qpos_motion(result, name="hybrid_history")
 
 
 def resample_bumi_plan(

@@ -15,6 +15,7 @@ from omg.realtime.bumi_motion_mux import (
     BumiMotionSourceMux,
     BumiTrackerExecutionHistory,
     BumiTrajectoryHistory,
+    blend_bumi_history_toward_measurement,
 )
 from omg.realtime.dynamic_condition import DynamicConditionController
 from omg.realtime.gmt_trajectory import (
@@ -100,8 +101,18 @@ class _AckReader:
 
 
 class _LowStateReader:
-    def __init__(self, order_hash: bytes) -> None:
+    def __init__(
+        self,
+        order_hash: bytes,
+        root_quat_wxyz: np.ndarray | None = None,
+    ) -> None:
         self.order_hash = order_hash
+        self.root_quat_wxyz = np.asarray(
+            [1.0, 0.0, 0.0, 0.0]
+            if root_quat_wxyz is None
+            else root_quat_wxyz,
+            dtype=np.float32,
+        )
         self.available = True
         self.sequence = 0
         self.samples: list[GmtLowStateFeedback] = []
@@ -115,7 +126,7 @@ class _LowStateReader:
             sequence=self.sequence,
             captured_unix_ns=self.sequence * 1_000_000,
             joint_order_hash=self.order_hash,
-            root_quat_wxyz=np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            root_quat_wxyz=self.root_quat_wxyz,
             joint_pos=(
                 np.arange(21, dtype=np.float32) + np.float32(self.sequence)
             ),
@@ -176,7 +187,7 @@ def _runtime(
                 history_fps=30.0,
                 history_frames=10,
             )
-            if history_source == "lowstate"
+            if history_source in {"lowstate", "hybrid"}
             else None
         ),
         lowstate_reader=lowstate_reader,
@@ -287,6 +298,86 @@ def test_lowstate_history_waits_for_ten_real_samples_and_fuses_reference_xyz() -
     runtime.step()
     assert len(planner.requests) == 1
     assert runtime.status()["planner_history"]["ready"] is False
+    runtime.close()
+
+
+def test_hybrid_history_smoothly_pulls_all_ten_frames_toward_lowstate() -> None:
+    controller = DynamicConditionController(tracker_fps=50.0)
+    order_hash = joint_order_sha256([f"j{i}" for i in range(21)])
+    yaw = np.deg2rad(90.0)
+    reader = _LowStateReader(
+        order_hash,
+        root_quat_wxyz=np.asarray(
+            [np.cos(yaw / 2.0), 0.0, 0.0, np.sin(yaw / 2.0)],
+            dtype=np.float32,
+        ),
+    )
+    runtime, planner, _publisher, _player = _runtime(
+        controller,
+        history_source="hybrid",
+        lowstate_reader=reader,
+    )
+    controller.accept_text("walk forward")
+    for _ in range(16):
+        runtime.step()
+    assert planner.requests == []
+
+    reference = runtime.planner_history.planner_history()
+    assert runtime.lowstate_history is not None
+    measured = runtime.lowstate_history.planner_history()
+    expected = blend_bumi_history_toward_measurement(
+        reference,
+        measured,
+        beta=runtime.config.hybrid_history_beta,
+        max_rotation_error_radians=np.deg2rad(
+            runtime.config.hybrid_max_rotation_error_degrees
+        ),
+    )
+    runtime.step()
+
+    assert len(planner.requests) == 1
+    request = planner.requests[0]
+    np.testing.assert_allclose(request.qpos_36_history, expected, atol=1e-6)
+    assert request.metadata["history_source"] == "hybrid"
+    assert request.metadata["hybrid_history_beta"] == list(
+        runtime.config.hybrid_history_beta
+    )
+    # The oldest frame is only lightly corrected, while the newest joints use
+    # the complete measured state. Root yaw is capped independently at 25 deg.
+    oldest_error = np.linalg.norm(expected[0, 7:] - reference[0, 7:])
+    newest_error = np.linalg.norm(expected[-1, 7:] - reference[-1, 7:])
+    assert 0.0 < oldest_error < newest_error
+    np.testing.assert_allclose(expected[-1, 7:], measured[-1, 7:], atol=1e-6)
+    runtime.close()
+
+
+def test_hybrid_rejects_unsafe_measured_root_tilt() -> None:
+    controller = DynamicConditionController(tracker_fps=50.0)
+    order_hash = joint_order_sha256([f"j{i}" for i in range(21)])
+    roll = np.deg2rad(60.0)
+    reader = _LowStateReader(
+        order_hash,
+        root_quat_wxyz=np.asarray(
+            [np.cos(roll / 2.0), np.sin(roll / 2.0), 0.0, 0.0],
+            dtype=np.float32,
+        ),
+    )
+    runtime, planner, _publisher, _player = _runtime(
+        controller,
+        history_source="hybrid",
+        lowstate_reader=reader,
+    )
+    controller.accept_text("walk forward")
+    for _ in range(30):
+        runtime.step()
+
+    assert planner.requests == []
+    history_status = runtime.status()["planner_history"]
+    assert history_status["ready"] is False
+    assert history_status["measured_root_tilt_degrees"] == pytest.approx(60.0)
+    assert history_status["rejection_reason"].startswith(
+        "unsafe_measured_root_tilt:"
+    )
     runtime.close()
 
 

@@ -14,11 +14,13 @@ BUMI ONNX Planner → BUMI realtime bridge → Redis trajectory_v1 → GMT → G
 Planner、ONNX 和 T5 在终端 1 中常驻。终端 2 仍只执行 GMT 原来的
 `./simulation.sh`。终端 3 可以反复发送文本、WAV 或 `stand`。
 
-Planner 历史来源可选。默认 `--history-source reference` 延续现有行为，10 帧
-history 来自 Bridge 已发布的参考。增加 `--history-source lowstate` 后，10 帧
-history 的根四元数和 21 个关节角来自 GMT 的真实 LowState，只有全局 root xyz
-逐 tick 从当前 reference trajectory 补入。该模式使用独立 Redis key
-`gmt_online_frame_bumi_lowstate`，不会改变 GMT motion 输入 key。
+Planner 历史来源有三种。默认 `--history-source reference` 延续现有行为，10 帧
+history 来自 Bridge 已发布的参考；`lowstate` 让全部 10 帧的根四元数和 21 个
+关节角直接来自 GMT 的真实 LowState；推荐实机先使用 `hybrid`，它让旧帧更接近
+干净 reference、越靠近当前时刻越接近 LowState，从而避免 history 最后一帧突然
+跳到跟踪失败姿态。后两种模式的全局 root xyz 都逐 tick 从 reference trajectory
+补入，并使用独立 Redis key `gmt_online_frame_bumi_lowstate`，不会改变 GMT motion
+输入 key。
 
 ## 固定站立语义
 
@@ -108,6 +110,39 @@ python -m omg.cli.realtime.bumi_gmt_runtime \
 GMT 以 50 Hz 发布实测反馈，OMG 融合后重采样为 10 帧 @ 30 Hz。首次规划前会
 等待完整实测时间窗；反馈断流时暂停新规划且不自动退回 reference history，已有
 计划仍连续执行，之后平滑回固定站立。默认模式不创建 LowState Redis 读取线程。
+
+实机推荐先测试 Hybrid history：
+
+```bash
+  --history-source hybrid \
+  --redis-lowstate-key gmt_online_frame_bumi_lowstate \
+  --lowstate-max-age-ms 200
+```
+
+默认从旧到新的融合权重为：
+
+```text
+beta = [0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 1.00]
+```
+
+每一帧关节使用 `q_ref + beta * (q_measured - q_ref)`，不是只校正最后一帧。
+根四元数不做分量线性平均：先计算
+`R_error = R_measured * inverse(R_reference)`，把默认最大 25 度的限幅误差按
+beta 做旋转插值，再左乘回 reference。实测根倾角超过 45 度，或 reference 与
+实测 body-up 的 tilt 误差超过 20 度时，Bridge 会把它视为可能倾倒/控制失稳，
+暂停新 replan 并等待重新积累安全的完整 history；已有动作缓冲不会被直接清空。
+
+需要调参时可显式写：
+
+```bash
+  --hybrid-history-beta 0.10,0.15,0.20,0.30,0.40,0.50,0.60,0.70,0.80,1.00 \
+  --hybrid-max-rotation-error-deg 25 \
+  --hybrid-max-tilt-error-deg 20 \
+  --hybrid-hard-root-tilt-deg 45
+```
+
+若修改 `--history-frames`，Hybrid 的 beta 数量也必须完全一致，且最后一个权重
+必须是 `1.0`。
 
 如不需要电脑音响播放音乐，删除 `--play-audio`。指定该参数时必须存在
 `/usr/bin/ffplay`。声音从运行终端 1 的主机默认音频设备输出。

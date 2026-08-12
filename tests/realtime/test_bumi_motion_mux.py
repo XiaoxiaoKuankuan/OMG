@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
+from scipy.spatial.transform import Rotation
 
 from omg.realtime.bumi_motion_mux import (
     BumiMotionMuxConfig,
     BumiMotionSourceMux,
     BumiTrackerExecutionHistory,
+    blend_bumi_history_toward_measurement,
     resample_bumi_plan,
+    root_tilt_angle_wxyz,
+    root_tilt_error_angle_wxyz,
 )
 
 
@@ -85,3 +90,56 @@ def test_planner_history_is_actual_executed_motion_not_repeated_current() -> Non
     assert result.shape == (10, 28)
     assert np.all(np.diff(result[:, 0]) > 0.0)
     assert np.unique(result[:, 0]).size == 10
+
+
+def test_hybrid_history_blends_every_frame_and_caps_geodesic_rotation() -> None:
+    reference = np.repeat(_idle()[None], 10, axis=0)
+    reference[:, 0] = np.linspace(0.0, 0.9, 10, dtype=np.float32)
+    measured = reference.copy()
+    measured[:, :3] += 100.0  # Root translation must never come from LowState.
+    measured[:, 7:] = 1.0
+    measured_yaw = Rotation.from_euler("z", 90.0, degrees=True).as_quat()
+    measured[:, 3:7] = measured_yaw[[3, 0, 1, 2]]
+    beta = np.asarray(
+        [0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 1.00],
+        dtype=np.float32,
+    )
+
+    hybrid = blend_bumi_history_toward_measurement(
+        reference,
+        measured,
+        beta=beta,
+        max_rotation_error_radians=np.deg2rad(30.0),
+    )
+
+    np.testing.assert_allclose(hybrid[:, :3], reference[:, :3], atol=1e-7)
+    expected_joints = reference[:, 7:] + beta[:, None] * (
+        measured[:, 7:] - reference[:, 7:]
+    )
+    np.testing.assert_allclose(hybrid[:, 7:], expected_joints, atol=1e-6)
+    rotations = Rotation.from_quat(hybrid[:, 3:7][:, [1, 2, 3, 0]])
+    yaw_degrees = rotations.as_euler("xyz", degrees=True)[:, 2]
+    np.testing.assert_allclose(yaw_degrees, beta * 30.0, atol=1e-4)
+    assert yaw_degrees[0] == pytest.approx(3.0, abs=1e-4)
+    assert yaw_degrees[-1] == pytest.approx(30.0, abs=1e-4)
+    np.testing.assert_allclose(
+        np.linalg.norm(hybrid[:, 3:7], axis=1), 1.0, atol=1e-6
+    )
+
+
+def test_root_tilt_metrics_ignore_yaw_and_detect_roll() -> None:
+    identity = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    yaw_xyzw = Rotation.from_euler("z", 120.0, degrees=True).as_quat()
+    roll_xyzw = Rotation.from_euler("x", 50.0, degrees=True).as_quat()
+    yaw_wxyz = yaw_xyzw[[3, 0, 1, 2]]
+    roll_wxyz = roll_xyzw[[3, 0, 1, 2]]
+
+    assert np.rad2deg(root_tilt_angle_wxyz(yaw_wxyz)) == pytest.approx(
+        0.0, abs=1e-5
+    )
+    assert np.rad2deg(root_tilt_angle_wxyz(roll_wxyz)) == pytest.approx(
+        50.0, abs=1e-5
+    )
+    assert np.rad2deg(root_tilt_error_angle_wxyz(identity, roll_wxyz)) == pytest.approx(
+        50.0, abs=1e-5
+    )
