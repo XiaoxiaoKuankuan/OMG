@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from hydra import compose, initialize_config_dir
 
 
@@ -41,3 +42,18 @@ def test_compose_100m_omnimodal():
     assert dataset.use_audio is True
     assert dataset.use_human_motion is True
     assert dataset.revision == "6e0dfbc1c5298bff14d4e2b1459ad678af0a38e7"
+
+
+@pytest.mark.parametrize("experiment", ["50m_bumi", "100m_bumi", "300m_bumi"])
+def test_bumi_experiments_use_full_motion_loss(experiment):
+    config_dir = str(Path(__file__).resolve().parents[2] / "configs" / "generation")
+    with initialize_config_dir(version_base="1.3", config_dir=config_dir):
+        cfg = compose(
+            config_name="train",
+            overrides=[f"exp={experiment}", "logger=none", "trainer=1gpu"],
+        )
+    assert cfg.loss.simple_root_pos > 0.0
+    assert cfg.loss.body_pos_consistency > 0.0
+    assert cfg.loss.terrain_penetration > 0.0
+    assert cfg.loss.contact_velocity > 0.0
+    assert cfg.loss.seam_body_pos > 0.0

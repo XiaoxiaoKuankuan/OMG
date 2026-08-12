@@ -5,7 +5,7 @@ defaults:
   - override /model: motion_generator
   - override /denoiser: transformer_100m
   - override /diffusion: guided_x0
-  - override /loss: diffusion_only
+  - override /loss: full
 
 exp_name: bumi_transformer_guided_100m_rot6d_omnimodal
 init_weights_adapter: g1_to_bumi
